@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// y = a * x + y. The root struct is the only shader input: one pointer in
+// the push-constant block (the KoreGP root convention), everything else is
+// reached through it.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar) buffer FloatArray { float v[]; };
+
+layout(buffer_reference, scalar) readonly buffer SaxpyRoot {
+   FloatArray x;
+   FloatArray y;
+   float a;
+   uint count;
+};
+
+layout(push_constant, scalar) uniform Push { SaxpyRoot root; };
+
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   if (i >= root.count)
+      return;
+   root.y.v[i] = root.a * root.x.v[i] + root.y.v[i];
+}

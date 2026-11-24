@@ -1,0 +1,34 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Reads every texel of a texture chosen by index into the texture heap and
+// writes it, packed, to plain memory where the CPU can check it.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The KoreGP heap convention: set 0, binding 0.
+layout(set = 0, binding = 0) uniform texture2D kgpTextures[];
+
+layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
+
+layout(buffer_reference, scalar) readonly buffer HeapFetchRoot {
+   UintArray dst;
+   uint textureIndex;
+   uint width;
+   uint height;
+};
+
+layout(push_constant, scalar) uniform Push { HeapFetchRoot root; };
+
+void main()
+{
+   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+   if (p.x >= int(root.width) || p.y >= int(root.height))
+      return;
+
+   vec4 t = texelFetch(kgpTextures[root.textureIndex], p, 0);
+   root.dst.v[p.y * int(root.width) + p.x] = packUnorm4x8(t);
+}

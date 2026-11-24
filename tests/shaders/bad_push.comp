@@ -1,0 +1,20 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Must be REJECTED: the push-constant block carries more than the root
+// pointer. KoreGP has no push constants; only the pointer exists.
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) buffer Root { uint v; };
+
+layout(push_constant, scalar) uniform Push {
+   Root root;
+   uint extra;
+};
+
+void main()
+{
+   root.v = extra;
+}

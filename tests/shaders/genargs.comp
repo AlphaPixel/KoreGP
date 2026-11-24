@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Computes the group counts for a later indirect dispatch of saxpy and
+// writes them where that dispatch will read them: GPU-generated dispatch
+// arguments, with no CPU round trip.
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
+
+layout(buffer_reference, scalar) readonly buffer GenArgsRoot {
+   UintArray args;
+   uint count;
+};
+
+layout(push_constant, scalar) uniform Push { GenArgsRoot root; };
+
+void main()
+{
+   root.args.v[0] = (root.count + 63u) / 64u;
+   root.args.v[1] = 1u;
+   root.args.v[2] = 1u;
+}

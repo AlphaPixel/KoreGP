@@ -1,0 +1,18 @@
+diff --git a/src/nouveau/winsys/nouveau_context.c b/src/nouveau/winsys/nouveau_context.c
+index 00551d9..260bac3 100644
+--- a/src/nouveau/winsys/nouveau_context.c
++++ b/src/nouveau/winsys/nouveau_context.c
+@@ -242,6 +242,13 @@ nouveau_ws_video_context_init(struct nouveau_ws_device *dev,
+ 
+    if (engines & NOUVEAU_WS_ENGINE_VDEC) {
+       uint32_t obj_class = nouveau_ws_context_find_class(classes, 0xb0);
++      if (!obj_class) {
++         /* No video decoder class (e.g. the DRM shim).  This is a probe,
++          * so fail quietly instead of asserting in subchan_alloc.
++          */
++         ret = -ENODEV;
++         goto fail_subchan;
++      }
+       ret = nouveau_ws_subchan_alloc(dev->fd, req.channel, base | 0x00b0,
+                                      obj_class, &ctx->vdec);
+       if (ret)

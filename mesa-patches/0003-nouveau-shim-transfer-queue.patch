@@ -1,0 +1,17 @@
+diff --git a/src/nouveau/drm-shim/nouveau_noop.c b/src/nouveau/drm-shim/nouveau_noop.c
+--- a/src/nouveau/drm-shim/nouveau_noop.c
++++ b/src/nouveau/drm-shim/nouveau_noop.c
+@@ -556,8 +556,12 @@ drm_shim_driver_init(void)
+    shim_device.driver_ioctl_count = ARRAY_SIZE(driver_ioctls);
+
+    shim_device.version_major = 1;
+-   shim_device.version_minor = 3;
++   /* 1.4.1: NVK exposes its transfer-only queue family (the copy engine
++    * driven directly) from this version on.  Channel allocation is a no-op
++    * here, so the shim can claim it.
++    */
++   shim_device.version_minor = 4;
+    shim_device.version_patchlevel = 1;
+
+    nouveau_driver_get_device_info();
+

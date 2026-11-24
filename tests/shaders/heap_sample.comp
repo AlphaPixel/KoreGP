@@ -1,0 +1,39 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Samples a texture from the texture heap with a sampler from the sampler
+// heap, both chosen by index, at a point offset from each texel centre.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The KoreGP heap convention: textures at binding 0, samplers at binding 1.
+layout(set = 0, binding = 0) uniform texture2D kgpTextures[];
+layout(set = 0, binding = 1) uniform sampler kgpSamplers[];
+
+layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
+
+layout(buffer_reference, scalar) readonly buffer HeapSampleRoot {
+   UintArray dst;
+   uint textureIndex;
+   uint samplerIndex;
+   uint width;
+   uint height;
+   float offsetX;   // in texels, from the texel centre
+};
+
+layout(push_constant, scalar) uniform Push { HeapSampleRoot root; };
+
+void main()
+{
+   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+   if (p.x >= int(root.width) || p.y >= int(root.height))
+      return;
+
+   vec2 uv = (vec2(p) + vec2(0.5 + root.offsetX, 0.5)) /
+             vec2(root.width, root.height);
+   vec4 t = textureLod(sampler2D(kgpTextures[root.textureIndex],
+                                 kgpSamplers[root.samplerIndex]), uv, 0.0);
+   root.dst.v[p.y * int(root.width) + p.x] = packUnorm4x8(t);
+}

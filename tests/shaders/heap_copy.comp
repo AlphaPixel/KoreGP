@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Writes one texture descriptor into the texture heap from a shader: the
+// heap is plain memory, so this is eight stores.
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
+
+layout(buffer_reference, scalar) readonly buffer HeapCopyRoot {
+   UintArray src;    // staging array of 256-bit descriptors
+   UintArray heap;   // the texture heap
+   uint srcIndex;
+   uint dstIndex;
+};
+
+layout(push_constant, scalar) uniform Push { HeapCopyRoot root; };
+
+void main()
+{
+   for (uint i = 0u; i < 8u; i++)
+      root.heap.v[root.dstIndex * 8u + i] = root.src.v[root.srcIndex * 8u + i];
+}

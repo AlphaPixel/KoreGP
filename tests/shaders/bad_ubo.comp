@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Must be REJECTED: it reads a descriptor-set buffer. KoreGP has no
+// descriptor sets; memory is reached through the root pointer.
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, scalar) buffer Root { uint v; };
+
+layout(push_constant, scalar) uniform Push { Root root; };
+
+layout(set = 0, binding = 0) uniform Params { uint value; } params;
+
+void main()
+{
+   root.v = params.value;
+}

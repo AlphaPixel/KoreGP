@@ -1,0 +1,29 @@
+diff --git a/meson.options b/meson.options
+index beb2837..72ada9d 100644
+--- a/meson.options
++++ b/meson.options
+@@ -923,3 +923,10 @@ option(
+   value : true,
+   description : 'Build panfrost disassemblers. Explicitly setting this option to false will cause the panfrost stack to build without disassemblers. This should be left enabled for distro builds.'
+ )
++
++option(
++  'koregp',
++  type : 'boolean',
++  value : false,
++  description : 'Build the KoreGP frontend from src/koregp (out-of-tree overlay; needs vulkan-drivers=nouveau).'
++)
+diff --git a/src/meson.build b/src/meson.build
+index c4dece9..64d169c 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -109,6 +109,9 @@ if with_microsoft_clc or with_gallium_d3d12 or with_spirv_to_dxil or with_micros
+ endif
+ if with_any_nouveau
+   subdir('nouveau')
++  if get_option('koregp')
++    subdir('koregp')
++  endif
+ endif
+ if with_gfxstream_vk
+   dep_virtgpu_kumquat_ffi = null_dep

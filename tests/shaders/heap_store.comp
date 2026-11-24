@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Fills a texture chosen by heap index with a pattern, through storage
+// image access. The same heap entry serves sampling and storage.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D kgpImages[];
+
+layout(buffer_reference, scalar) readonly buffer HeapStoreRoot {
+   uint textureIndex;
+   uint width;
+   uint height;
+};
+
+layout(push_constant, scalar) uniform Push { HeapStoreRoot root; };
+
+void main()
+{
+   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+   if (p.x >= int(root.width) || p.y >= int(root.height))
+      return;
+
+   // Must match stored_texel() in tests/kgp_heap.c.
+   ivec4 c = ivec4(p.y & 255, p.x & 255, (p.x ^ p.y) & 255, 128);
+   imageStore(kgpImages[root.textureIndex], p, vec4(c) / 255.0);
+}

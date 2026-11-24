@@ -1,0 +1,102 @@
+diff --git a/src/drm-shim/device.c b/src/drm-shim/device.c
+index 7df5900..3a242ad 100644
+--- a/src/drm-shim/device.c
++++ b/src/drm-shim/device.c
+@@ -36,6 +36,7 @@
+ #include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ #include "drm-uapi/drm.h"
+ #include "drm_shim.h"
+@@ -283,11 +284,81 @@ drm_shim_ioctl_stub(int fd, unsigned long request, void *arg)
+    return 0;
+ }
+ 
++/* dma-buf sharing between opens of the shim device.  The "dma-buf" is a
++ * memfd of the BO's size whose inode number names the BO.  The reference
++ * taken at export is never dropped, which is fine for a shim.
++ */
++static struct hash_table_u64 *prime_bos;
++
++static int
++drm_shim_ioctl_prime_handle_to_fd(int fd, unsigned long request, void *arg)
++{
++   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
++   struct drm_prime_handle *p = arg;
++   struct stat st;
++
++   struct shim_bo *bo = drm_shim_bo_lookup(shim_fd, p->handle);
++   if (!bo)
++      return -ENOENT;
++
++   int buf_fd = memfd_create("shim dma-buf", MFD_CLOEXEC);
++   if (buf_fd < 0 || ftruncate(buf_fd, bo->size) != 0 ||
++       fstat(buf_fd, &st) != 0) {
++      if (buf_fd >= 0)
++         close(buf_fd);
++      drm_shim_bo_put(bo);
++      return -ENOMEM;
++   }
++
++   mtx_lock(&shim_device.lock);
++   if (!prime_bos)
++      prime_bos = _mesa_hash_table_u64_create(NULL);
++   _mesa_hash_table_u64_insert(prime_bos, st.st_ino, bo);
++   mtx_unlock(&shim_device.lock);
++
++   p->fd = buf_fd;
++   return 0;
++}
++
++static int
++drm_shim_ioctl_prime_fd_to_handle(int fd, unsigned long request, void *arg)
++{
++   struct shim_fd *shim_fd = drm_shim_fd_lookup(fd);
++   struct drm_prime_handle *p = arg;
++   struct stat st;
++
++   if (fstat(p->fd, &st) != 0)
++      return -EBADF;
++
++   mtx_lock(&shim_device.lock);
++   struct shim_bo *bo =
++      prime_bos ? _mesa_hash_table_u64_search(prime_bos, st.st_ino) : NULL;
++   mtx_unlock(&shim_device.lock);
++   if (!bo)
++      return -EINVAL;
++
++   /* As the kernel does: one handle per BO and file. */
++   mtx_lock(&shim_fd->handle_lock);
++   hash_table_foreach(shim_fd->handles, entry) {
++      if (entry->data == bo) {
++         p->handle = (uintptr_t)entry->key;
++         mtx_unlock(&shim_fd->handle_lock);
++         return 0;
++      }
++   }
++   mtx_unlock(&shim_fd->handle_lock);
++
++   p->handle = drm_shim_bo_get_handle(shim_fd, bo);
++   return 0;
++}
++
+ ioctl_fn_t core_ioctls[] = {
+    [_IOC_NR(DRM_IOCTL_VERSION)] = drm_shim_ioctl_version,
+    [_IOC_NR(DRM_IOCTL_GET_UNIQUE)] = drm_shim_ioctl_get_unique,
+    [_IOC_NR(DRM_IOCTL_GET_CAP)] = drm_shim_ioctl_get_cap,
+    [_IOC_NR(DRM_IOCTL_GEM_CLOSE)] = drm_shim_ioctl_gem_close,
++   [_IOC_NR(DRM_IOCTL_PRIME_HANDLE_TO_FD)] = drm_shim_ioctl_prime_handle_to_fd,
++   [_IOC_NR(DRM_IOCTL_PRIME_FD_TO_HANDLE)] = drm_shim_ioctl_prime_fd_to_handle,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_CREATE)] = drm_shim_ioctl_syncobj_create,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD)] = drm_shim_ioctl_stub,
+@@ -295,6 +366,7 @@ ioctl_fn_t core_ioctls[] = {
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_RESET)] = drm_shim_ioctl_stub,
++   [_IOC_NR(DRM_IOCTL_SYNCOBJ_SIGNAL)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT)] = drm_shim_ioctl_stub,
+    [_IOC_NR(DRM_IOCTL_SYNCOBJ_QUERY)] = drm_shim_ioctl_stub,

@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// One float computed from three specialization constants, so that a test
+// can tell which values the pipeline was created with. Defaults: 10.5.
+
+layout(local_size_x = 1) in;
+
+layout(constant_id = 3) const uint SCALE = 1;
+layout(constant_id = 5) const float BIAS = 0.5;
+layout(constant_id = 9) const bool NEGATE = false;
+
+layout(buffer_reference, scalar) buffer SpecRoot { float result; };
+
+layout(push_constant, scalar) uniform Push { SpecRoot root; };
+
+void main()
+{
+   float r = float(SCALE) * 10.0 + BIAS;
+   root.result = NEGATE ? -r : r;
+}

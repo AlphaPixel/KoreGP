@@ -1,0 +1,52 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Exercises the three shader inputs that are not the root pointer:
+//  - a local array indexed at run time, which the compiler has to keep in
+//    shader-local (scratch) memory;
+//  - a constant table too big for immediates, which is uploaded after the
+//    shader code and read through a constant buffer;
+//  - gl_NumWorkGroups, which comes from the per-dispatch root record.
+// The CPU oracle is scratch_expected() in the test sources.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
+
+layout(buffer_reference, scalar) readonly buffer ScratchRoot {
+   UintArray src;
+   UintArray dst;
+   uint count;
+};
+
+layout(push_constant, scalar) uniform Push { ScratchRoot root; };
+
+const uint TABLE[64] = uint[64](
+     2u,   3u,   5u,   7u,  11u,  13u,  17u,  19u,
+    23u,  29u,  31u,  37u,  41u,  43u,  47u,  53u,
+    59u,  61u,  67u,  71u,  73u,  79u,  83u,  89u,
+    97u, 101u, 103u, 107u, 109u, 113u, 127u, 131u,
+   137u, 139u, 149u, 151u, 157u, 163u, 167u, 173u,
+   179u, 181u, 191u, 193u, 197u, 199u, 211u, 223u,
+   227u, 229u, 233u, 239u, 241u, 251u, 257u, 263u,
+   269u, 271u, 277u, 281u, 283u, 293u, 307u, 311u);
+
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   if (i >= root.count)
+      return;
+
+   uint s = root.src.v[i];
+
+   uint tmp[64];
+   for (uint k = 0u; k < 64u; k++)
+      tmp[k] = s * TABLE[(k + i) & 63u] + k;
+
+   uint acc = gl_NumWorkGroups.x;
+   for (uint k = 0u; k < 64u; k++)
+      acc += tmp[(k * 7u + s) & 63u];
+
+   root.dst.v[i] = acc;
+}
