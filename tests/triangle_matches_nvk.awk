@@ -4,7 +4,7 @@
 # included) to the draw macro and its parameters.
 #
 # Not compared: packet headers (see init3d_matches_nvk.sh for why).
-# Masked: every address. Those are the first colour target's, the depth
+# Masked: every address. Those are the colour targets', the depth
 # target's, the two root
 # pointers and the eight sample-location bytes NVK leaves partly
 # uninitialized (all LOAD_ROOT_TABLE data), the index buffer's (the bind
@@ -86,7 +86,7 @@ END {
          ib = indirect ? 3 : 2
       if (l ~ /CALL_MME_MACRO\(14\)/)
          ib = 2
-      if (ib > 0 || l ~ /LOAD_ROOT_TABLE|SET_COLOR_TARGET_[AB]\(0\)|SET_ZT_[AB] |PROGRAM_ADDRESS_[AB]/) {
+      if (ib > 0 || l ~ /LOAD_ROOT_TABLE|SET_COLOR_TARGET_[AB]\([0-7]\)|SET_ZT_[AB] |PROGRAM_ADDRESS_[AB]/) {
          gsub(/\(0x[0-9a-f]+\)/, "(masked)", l)
          if (ib > 0) ib--
       }

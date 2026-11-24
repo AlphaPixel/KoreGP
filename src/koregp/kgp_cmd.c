@@ -480,6 +480,7 @@ kgpSetActiveTextureHeapPtr(KgpCommandBuffer cb, void *heapGpu, uint32_t count)
    if (!kgp_check_ptr(cb, "kgpSetActiveTextureHeapPtr: the heap", heapGpu,
                       (uint64_t)count * sizeof(KgpDescriptor256), 1))
       return;
+   cb->heap_counts[0] = addr != 0 ? count : 0;
 
    /* We can't actually set a size of 0 but we can set a NULL address */
    if (addr == 0 || count == 0) {
@@ -522,6 +523,7 @@ kgpSetActiveSamplerHeapPtr(KgpCommandBuffer cb, void *heapGpu, uint32_t count)
    if (!kgp_check_ptr(cb, "kgpSetActiveSamplerHeapPtr: the heap", heapGpu,
                       (uint64_t)count * sizeof(KgpDescriptor256), 1))
       return;
+   cb->heap_counts[1] = addr != 0 ? count : 0;
 
    /* We can't actually set a size of 0 but we can set a NULL address */
    if (addr == 0 || count == 0) {
@@ -612,13 +614,6 @@ kgp_cb_dispatch(struct KgpCommandBuffer_T *cb, void *dataGpu,
       cb->failed = true;
       return;
    }
-   if (unlikely(pipeline->user_root_size_B > 0 &&
-                (uintptr_t)dataGpu % KGP_CBUF_ALIGN_B != 0)) {
-      kgp_err("dispatch: under root convention v1 the root pointer must be "
-              "%u-byte aligned", KGP_CBUF_ALIGN_B);
-      cb->failed = true;
-      return;
-   }
    if (unlikely(groups_gpu != 0 &&
                 (groups_gpu % 4 != 0 || !pipeline->qmd_patchable))) {
       kgp_err("dispatch: indirect group counts must be 4-byte aligned%s",
@@ -648,13 +643,14 @@ kgp_cb_dispatch(struct KgpCommandBuffer_T *cb, void *dataGpu,
 
    /* Built on the stack and copied: the upload map is write-combined. */
    uint32_t qmd[NAK_MAX_QMD_DWORDS];
-   kgp_pipeline_fill_qmd(info, pipeline, qmd, root_addr, (uintptr_t)dataGpu,
+   kgp_pipeline_fill_qmd(info, pipeline, qmd, root_addr,
                          groups.x, groups.y, groups.z);
    memcpy(map, qmd, qmd_size_B);
 
    const struct kgp_root_record root = {
       .root = (uintptr_t)dataGpu,
       .group_count = { groups.x, groups.y, groups.z },
+      .heap_counts = { cb->heap_counts[0], cb->heap_counts[1] },
    };
    memcpy((char *)map + root_offset, &root, sizeof(root));
 

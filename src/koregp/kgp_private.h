@@ -32,23 +32,25 @@ enum kgp_debug {
    KGP_DEBUG_PUSH = 1 << 0,   /* dump every submitted pushbuf to stderr */
    KGP_DEBUG_ASM  = 1 << 1,   /* dump NAK assembly at pipeline creation */
    KGP_DEBUG_NIR  = 1 << 2,   /* dump NIR before NAK */
-   /* Root convention v1 (experimental): see kgp_nir_lower_root.c. */
-   KGP_DEBUG_ROOT_V1 = 1 << 4,
    KGP_DEBUG_VALIDATE = 1 << 5,   /* KGP_DEBUG=1: kgp_validate.c */
 };
 
-/* Root convention v0 (delta D5): bound as cbuf 0 on every dispatch.
+/* The root convention (delta D5): bound as cbuf 0 on every dispatch.
  * kgp_nir_lower_root turns push-constant loads into loads from here.
  */
 struct kgp_root_record {
    uint64_t root;              /* kgpDispatch dataGpu; push-constant offset 0 */
    uint32_t group_count[3];    /* gl_NumWorkGroups */
-   uint32_t pad[11];
+   /* Entries in the texture and the sampler heap as this command buffer
+    * set them: read only by shaders compiled under validation
+    * (kgp_nir_lower_heap), which check their heap indices against them.
+    */
+   uint32_t heap_counts[2];
+   uint32_t pad[9];
 };
 #define KGP_ROOT_PUSH_SIZE_B 8 /* how much of it SPIR-V push constants may read */
 #define KGP_CBUF_ROOT 0
 #define KGP_CBUF_SHADER_DATA 1
-#define KGP_CBUF_USER_ROOT 2   /* root convention v1 only */
 /* Raster (delta D10): Turing's eight hardware root tables are constant
  * buffers 24 to 31 in every stage. Table 0 holds the draw parameters NVK's
  * macros maintain; the two root pointers go where NVK keeps Vulkan push
@@ -58,10 +60,12 @@ struct kgp_root_record {
 #define KGP_GFX_CBUF_DRAW_PARAMS 24
 #define KGP_GFX_CBUF_ROOT 31
 #define KGP_GFX_ROOT_TABLE 7
+/* Under validation the two heap counts follow the two root pointers. */
+#define KGP_GFX_ROOT_HEAP_COUNTS_OFFSET_B 16
 /* Ancestor: nvk_min_cbuf_alignment() on Turing+, NVK_MAX_CBUF_SIZE */
 #define KGP_CBUF_ALIGN_B 64
-/* What validation asks of a root pointer under root convention v0. The
- * proposal names no number; NAK loads through a root in 32-bit words.
+/* What validation asks of a root pointer. The proposal names no number;
+ * NAK loads through a root in 32-bit words.
  */
 #define KGP_ROOT_ALIGN_B 4
 #define KGP_MAX_CBUF_SIZE_B (64 * 1024)
@@ -116,12 +120,6 @@ struct KgpPipeline_T {
    bool qmd_patchable;         /* false: field layout not word-aligned */
    uint8_t qmd_size_dw;        /* dword index of the X,Y,Z group counts */
    struct kgp_qmd_addr_patch qmd_root_record;   /* cbuf 0 address */
-   struct kgp_qmd_addr_patch qmd_user_root;     /* cbuf 2 address (root v1) */
-
-   /* Root convention v1: bytes of the caller's root struct the shader
-    * reads as constant buffer 2. 0 under v0, or if it reads none that way.
-    */
-   uint32_t user_root_size_B;
    uint32_t max_groups_y;      /* the QMD's Y and Z count fields are narrow */
    uint32_t max_groups_z;
 
@@ -162,13 +160,28 @@ struct KgpTexture_T {
 struct KgpDepthStencilState_T {
    bool needs_depth_target;
    bool needs_stencil;
+   /* Depth bias is raster state to the hardware and to NVK, emitted in
+    * another place than the snippet below (kgp_push_depth_bias).
+    */
+   bool bias_enable;
+   float bias, bias_slope, bias_clamp;
    uint32_t push_dw;
    uint32_t push[KGP_DS_PUSH_DW];
 };
 
 struct KgpBlendState_T {
    KgpBlendDesc desc;
+   bool enable;                /* the equation is not src * 1 + dst * 0 */
+   uint32_t write_mask;        /* four bits, R in bit 0 */
 };
+
+/* A KGP_COLOR_WRITE value as the hardware's four bits, R in bit 0. */
+static inline uint32_t
+kgp_color_write_bits(uint32_t color_write)
+{
+   return color_write == KGP_COLOR_WRITE_ALL ? 0xf :
+          color_write == KGP_COLOR_WRITE_NONE ? 0 : color_write;
+}
 
 struct KgpCommandBuffer_T {
    struct list_head link;      /* KgpQueue_T::recording, then ::pending */
@@ -204,6 +217,15 @@ struct KgpCommandBuffer_T {
    uint32_t rp_color_count;
    KGP_FORMAT rp_formats[KGP_MAX_COLOR_TARGETS];
    KGP_FORMAT rp_depth_format; /* KGP_FORMAT_NONE: no depth target */
+   /* The index buffer this command buffer last bound: an address and how
+    * far the hardware may read. Zero: none yet.
+    */
+   uint64_t ib_addr;
+   uint32_t ib_bytes;
+   /* Entries in the heaps this command buffer set: textures, samplers.
+    * Zero until it sets one, whatever an earlier command buffer left.
+    */
+   uint32_t heap_counts[2];
 };
 
 struct KgpQueue_T {
@@ -327,7 +349,6 @@ bool kgp_device_ensure_slm(struct KgpDevice_T *dev,
 void kgp_pipeline_fill_qmd(const struct nv_device_info *info,
                            const struct KgpPipeline_T *pipeline,
                            uint32_t *qmd, uint64_t root_record_addr,
-                           uint64_t user_root_addr,
                            uint32_t x, uint32_t y, uint32_t z);
 
 /* kgp_nir_lower_heap.c. The heap convention's fixed SPIR-V bindings. */
@@ -336,12 +357,12 @@ void kgp_pipeline_fill_qmd(const struct nv_device_info *info,
 #define KGP_MAX_HEAP_TEXTURES (1u << 20)   /* the handle's index widths */
 #define KGP_MAX_HEAP_SAMPLERS (1u << 12)
 struct nir_shader;
-bool kgp_nir_lower_heap(struct nir_shader *nir, bool *bad_out);
+bool kgp_nir_lower_heap(struct nir_shader *nir, bool bounds_check,
+                        bool *bad_out);
 
 /* kgp_nir_lower_root.c */
 struct nir_shader;
 bool kgp_nir_lower_root(struct nir_shader *nir, bool *bad_push_out);
-bool kgp_nir_lower_root_v1(struct nir_shader *nir, uint32_t *size_B_out);
 
 /* kgp_draw.c */
 #define KGP_DRAW_CB0_MEM_SIZE_B 4096

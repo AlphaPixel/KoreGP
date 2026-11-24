@@ -57,11 +57,6 @@ for t in kgp_reject kgp_saxpy kgp_prefix_sum kgp_scratch kgp_indirect kgp_spec k
    step "$t" mtest --suite koregp-hardware "$t"
 done
 
-# The same tests under root convention v1 (experimental, N1.H). Their
-# failures are recorded but do not count against N1.
-step rootv1_tests mtest --suite koregp-hardware \
-   kgp_saxpy_rootv1 kgp_prefix_sum_rootv1 kgp_scratch_rootv1 kgp_indirect_rootv1
-
 # N2, first contact: textures through the heap. Not part of N1 either. The
 # pair is the probe for delta D4: "linear" is the layout that needs nothing
 # from its memory; the tiled one sits in ordinary memory, which NVK never
@@ -72,20 +67,29 @@ step heap_tiled mtest --suite koregp-hardware kgp_heap
 
 # N2, GPU-side copies on the copy engine (T7). The Vulkan twin first; it
 # records on NVK's transfer queue, the one place NVK uses that engine.
-step vk_copy mtest --suite koregp-hardware vk_copy vk_copy_linear
+step vk_copy mtest --suite koregp-hardware vk_copy vk_copy_linear \
+   vk_copy_mip vk_copy_layer vk_copy_3d
 step copy_linear mtest --suite koregp-hardware kgp_copy_linear
 step copy_tiled mtest --suite koregp-hardware kgp_copy
+# One mip level, one array layer, a 3D texture (copy_pattern.h).
+step copy_sub mtest --suite koregp-hardware kgp_copy_mip kgp_copy_layer \
+   kgp_copy_3d
 
 # N3: graphics pipelines, then the first triangles, Vulkan twin first.
 step gfx_pipeline mtest --suite koregp-hardware kgp_gfx_pipeline
 step vk_triangle mtest --suite koregp-hardware \
-   vk_triangle vk_triangle_indirect vk_triangle_depth vk_triangle_stencil
+   vk_triangle vk_triangle_indirect vk_triangle_depth vk_triangle_stencil \
+   vk_triangle_state vk_triangle_mrt vk_triangle_srgb vk_triangle_rgba16f \
+   vk_triangle_rgba32f vk_triangle_r32f
 step triangle mtest --suite koregp-hardware kgp_triangle
 step triangle_indirect mtest --suite koregp-hardware kgp_triangle_indirect
 step textured mtest --suite koregp-hardware kgp_textured
 # R9b: one GPU-driven multi-draw with per-draw root data, through KoreGP's
 # own macro. No Vulkan twin.
 step multi mtest --suite koregp-hardware kgp_triangle_multi
+# The same with the draw list written by a compute shader (the proposal's
+# M2 exit test: GPU-driven multi-draw with per-draw root data).
+step multigpu mtest --suite koregp-hardware kgp_triangle_multigpu
 
 # R10: presentation. A headless swapchain in any window; on the monitor
 # only when nouveau drives one (a window opened by w0.sh present).
@@ -99,6 +103,13 @@ fi
 # D24S8 is mapped with its own kind, having failed without (2026-11-23).
 step depth mtest --suite koregp-hardware kgp_triangle_depth
 step stencil mtest --suite koregp-hardware kgp_triangle_stencil
+# Depth bias, colour write mask and blend constant (tri_scene.h, "state").
+step state mtest --suite koregp-hardware kgp_triangle_state
+# Two colour targets, the second through a per-target write mask.
+step mrt mtest --suite koregp-hardware kgp_triangle_mrt
+# The plain scene into render targets of other formats.
+step formats mtest --suite koregp-hardware kgp_triangle_srgb \
+   kgp_triangle_rgba16f kgp_triangle_rgba32f kgp_triangle_r32f
 
 # If anything KoreGP failed, a rerun of saxpy that narrows it down while the
 # window is open: waiting after every submit, with the pushbuf dumped at the
@@ -109,7 +120,7 @@ case "$failed" in *kgp_*|*copy_*|*heap_*)
    ;;
 esac
 # The same for raster, on the triangle; its own output shows the image.
-case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*multi*|*present*)
+case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*state*|*mrt*|*formats*|*multi*|*present*)
    tri_dbg() { KGP_DEBUG=sync kgp_run "$KGP_PREFIX/bin/kgp_triangle"; }
    STEP_TAIL=60 step diag_triangle tri_dbg
    ;;
@@ -156,25 +167,33 @@ if [ -x "$REL/bin/bench_dispatch" ]; then
    }
    STEP_TAIL=8 step bench run_bench
 
-   # N1.H: GPU time of the two root conventions, same binary, same window.
-   # Each workload under both conventions:
+   # The same for draws (tests/tri_scene.h, "bench"): one render pass per
+   # command buffer, every draw with its own pair of root pointers.
+   rel() {
+      VK_DRIVER_FILES="$REL/share/vulkan/icd.d/nouveau_icd.x86_64.json"       LD_LIBRARY_PATH="$REL/lib/x86_64-linux-gnu"       "$@"
+   }
+   run_bench_draw() {
+      for _ in 1 2 3; do
+         rel "$REL/bin/kgp_triangle" bench 2000 100 || return 1
+         rel "$REL/bin/vk_baseline" triangle bench 2000 100 2>/dev/null || return 1
+      done
+   }
+   STEP_TAIL=6 step bench_draw run_bench_draw
+
+   # GPU time (tests/bench_gpu.c):
    #  - saxpy at full and quarter size: memory-bound in the first window,
    #    and if so the time scales with the elements;
-   #  - the same work cut into 1024 dispatches: per-dispatch cost, where
-   #    v1's constant-cache invalidate would show;
-   #  - "loop": arithmetic on root fields, where v1's saved loads would.
+   #  - the same work cut into 1024 dispatches: per-dispatch cost;
+   #  - "loop": arithmetic on root fields.
    run_gpu_bench() {
       gpu() { LD_LIBRARY_PATH="$REL/lib/x86_64-linux-gnu" "$REL/bin/bench_gpu" "$@"; }
       local args
-      # The first workload runs again last: in the second window its first
-      # run was six times slower than the same work under v1 right after
-      # it, which is either the order or the convention.
+      # The first workload runs again last: the first GPU benchmark after a
+      # driver swap is slow (third window).
       for args in "saxpy" "saxpy 4194304" "saxpy 16777216 1024" \
                   "loop" "loop 1048576 1024" "saxpy"; do
          # shellcheck disable=SC2086
          gpu $args || return 1
-         # shellcheck disable=SC2086
-         KGP_DEBUG=rootv1 gpu $args || return 1
       done
    }
    STEP_TAIL=10 step bench_gpu run_gpu_bench

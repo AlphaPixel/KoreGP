@@ -46,7 +46,8 @@ The fourth window (2026-11-22 16:25) ran R7, depth and the two state
 objects, for the first time, and it is correct with the depth texture in
 ordinary memory: D4 is answered for depth as for colour. Unverified on
 hardware is only what the tests do not reach (copies of non-zero mips,
-layers and 3D textures; formats other than RGBA8 as render targets).
+layers and 3D textures, and render targets in formats other than RGBA8:
+all have tests since 2026-11-24 that no window has run).
 
 Next, in dependency order:
 
@@ -72,8 +73,52 @@ Next, in dependency order:
 - Specialization constants: done, correct on hardware (seventh window).
 - The `KGP_DEBUG=1` validation mode is written and passes offline
   (`kgp_validate`; the whole offline suite also passes with it on, with no
-  false alarm). Not written: the NIR-injected bounds checks on heap
-  indexing. `kgp_validate` passed on the GPU in the ninth window.
+  false alarm). `kgp_validate` passed on the GPU in the ninth window.
+  The NIR-injected bounds checks on heap indexing were added after it
+  (2026-11-24) and have not run on a GPU.
+
+Since the last window (2026-11-24, offline only):
+
+- Draw cost against NVK (`results-n1.md`, "Draw cost, offline"): about a
+  third of the CPU per recorded draw. The index buffer is now bound when
+  it changes, not on every draw. The suite's `bench_draw` step measures it
+  on hardware in the next window; low risk.
+- `kgp_triangle multigpu`: the multi-draw of R9b with its inputs written
+  by a compute shader in the same command buffer. The shader goes through
+  four candidate draws, drops the one marked invisible, and writes the
+  draw records, the count and both root structs of each remaining draw;
+  a barrier with `KGP_HAZARD_DRAW_ARGUMENTS`, then the multi-draw. This is
+  the proposal's M2 exit test in miniature. Recorded and submitted
+  offline; whether the picture is right is for the next window. Medium:
+  the first time a compute shader writes what the multi-draw macro and
+  the raster shaders read.
+- Depth bias (in `KgpDepthStencilDesc`), and in `KgpBlendDesc` a colour
+  write mask, a blend constant and the four constant factors. A blend
+  state whose equation is src * 1 + dst * 0 leaves the hardware's blending
+  off, so a write mask alone costs nothing. `kgp_triangle state` with a
+  Vulkan twin; `triangle_matches_nvk_state` holds KoreGP's stream to NVK's
+  for all of it. The picture is for the next window; low risk, the
+  methods being NVK's.
+- Copies of what the tests did not reach: one mip level, one array layer,
+  a 3D texture (`kgp_copy mip|layer|3d`), each with a Vulkan twin, a
+  pushbuf comparison, and a shader reading the result back. Offline the
+  methods are NVK's. On hardware they are new; low risk.
+- Render targets in formats other than RGBA8: `kgp_triangle srgb|rgba16f|
+  rgba32f|r32f`, each with a twin and a pushbuf comparison. Low risk.
+- More than one colour target, which no test had drawn into, and a write
+  mask per target in the pipeline (`KgpRasterDesc::colorWrite`, as in the
+  blog's prototype): `kgp_triangle mrt`, with a twin and a pushbuf
+  comparison. Low risk.
+- Root convention v1 is gone: the lowering pass, the third constant
+  buffer in the QMD, `KGP_DEBUG=rootv1`, the six `*_rootv1` tests and the
+  suite steps that ran them. 71 offline tests remain.
+- The validation mode's last piece: shaders of pipelines created under
+  `KGP_DEBUG=1` check their heap indices (`nvk-mapping.md` §7).
+  `kgp_validate` now also fetches through an index inside the heap and
+  one past its declared end, where a valid descriptor lies, and expects
+  the texture and zero. Offline the whole suite passes with the checks
+  compiled in; the result is for the next window. Medium: the checks add
+  control flow around every texture access, which no window has run.
 
 Done before the window:
 
@@ -225,7 +270,7 @@ script repeatedly; that is what escalated the first window.
 | N1.E tests | `tests/kgp_{saxpy,prefix_sum,scratch,indirect,reject}.c` | done; pass on hardware |
 | N1.F baseline | `tests/vk_baseline.c` | done; pass on hardware |
 | N1.G benchmark | `tests/bench_dispatch.c` | measured offline and on hardware |
-| N1.H root v1 | `kgp_nir_lower_root.c`, `tests/bench_gpu.c` | implemented behind `KGP_DEBUG=rootv1`; correct on hardware; a third fewer shader instructions; measured in two windows: equal or 5–9 % faster on saxpy, 25–81 % slower on the loop shader. **Not adopted; v0 stays** |
+| N1.H root v1 | `kgp_nir_lower_root.c`, `tests/bench_gpu.c` | implemented behind `KGP_DEBUG=rootv1`; correct on hardware; a third fewer shader instructions; measured in two windows: equal or 5–9 % faster on saxpy, 25–81 % slower on the loop shader. **Not adopted; v0 stays. Code removed 2026-11-24** |
 
 The exit is met (2026-11-21): saxpy, prefix sum, scratch and indirect
 dispatch correct on hardware, the benchmark repeated there, and `strace`
@@ -240,16 +285,18 @@ loads inside the loop, 26 under v1 with none) and the same work cut into
 1024 dispatches: v1 is 5–9 % faster on saxpy and 25 % (one dispatch) to
 81 % (1024 dispatches) slower on the loop shader. v0 stays the default and
 D5's alignment rule and D7's hazard bit are not needed for it. The v1 code
-is still in the tree behind `KGP_DEBUG=rootv1`; removing it is the owner's
-call. Open: why v1 is slower in a single dispatch of the loop shader. The
-third window repeated the measurement with the same result.
+was removed on 2026-11-24 at the owner's decision (commit `23992ca` is the
+last tree with it), so one question stays open for good here: why v1 was
+slower in a single dispatch of the loop shader. The third window repeated
+the measurement with the same result.
 
 Specialization constants were added on 2026-11-23: the proposal does not
 say how a caller's struct maps to SPIR-V spec ids, so the `constants`
 argument is a list of `{SpecId, value}` pairs (`KgpSpecialization`), one
 list for all stages of a pipeline, an unknown id refused. The `KGP_DEBUG=1`
 validation mode of the proposal's §7 was added the same day
-(`nvk-mapping.md` §7), without its shader-side bounds checks.
+(`nvk-mapping.md` §7); its shader-side bounds checks followed on
+2026-11-24.
 
 The risks listed here before the first hardware run did not materialize: a
 compute-only channel works (NVK never allocates one; the `KGP_DEBUG=nvkchan`
@@ -392,11 +439,12 @@ describe, and everything after the draw (the wait before the readback, and
 the copy engine reading a render target).
 
 Limits of what is built, all refused with an error rather than guessed at:
-one sample; no depth bias or depth bounds; two depth formats (`D32_FLOAT`,
+one sample; no depth bounds; two depth formats (`D32_FLOAT`,
 `D24_UNORM_S8_UINT`, the latter only in GPU-only memory); one stencil reference and one pair of masks for both
 faces; targets must be tiled 2D textures; viewport and scissor are the whole
-target; one blend equation for all targets, no blend constant, no write
-masks; indices are `uint32`; vertex and pixel stages only. A depth-stencil
+target; one blend state (equation, constant, write mask) for all targets,
+and a write mask per target in the pipeline;
+indices are `uint32`; vertex and pixel stages only. A depth-stencil
 state that tests or writes depth is refused at the draw in a pass without
 a depth target. A pipeline drawn into targets of another format than
 it was created for is refused at the draw.

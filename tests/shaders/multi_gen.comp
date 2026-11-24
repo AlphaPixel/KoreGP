@@ -1,0 +1,82 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// GPU-driven drawing in miniature (kgp_triangle multigpu): goes through a
+// table of candidate draws and, for each visible one, appends a record to
+// the argument array of a later multi-draw and writes that draw's two root
+// structs. The count is written last. Nothing of the draw list passes
+// through the CPU.
+
+layout(local_size_x = 1) in;
+
+// tri_scene.h: struct tri_candidate
+struct Candidate {
+   float instanceStep;
+   vec4 tint;
+   uint instanceCount;
+   uint firstInstance;
+   uint visible;
+};
+
+// kgp.h: KgpDrawIndexedArgs
+struct DrawArgs {
+   uint indexCount;
+   uint instanceCount;
+   uint firstIndex;
+   int vertexOffset;
+   uint firstInstance;
+};
+
+layout(buffer_reference, scalar) readonly buffer VertexArray { float v[]; };
+
+// tri.vert's and tri.frag's root structs, 64 bytes each.
+struct VsRoot {
+   VertexArray vertices;
+   float instanceStep;
+   float z;
+   uint pad[12];
+};
+struct PsRoot {
+   vec4 tint;
+   uint pad[12];
+};
+
+layout(buffer_reference, scalar) readonly buffer Candidates { Candidate c[]; };
+layout(buffer_reference, scalar) writeonly buffer ArgsArray { DrawArgs a[]; };
+layout(buffer_reference, scalar) writeonly buffer Count { uint v; };
+layout(buffer_reference, scalar) writeonly buffer VsRoots { VsRoot r[]; };
+layout(buffer_reference, scalar) writeonly buffer PsRoots { PsRoot r[]; };
+
+// tri_scene.h: struct tri_gen_root
+layout(buffer_reference, scalar) readonly buffer GenRoot {
+   Candidates candidates;
+   ArgsArray args;
+   Count count;
+   VsRoots vsRoots;
+   PsRoots psRoots;
+   VertexArray vertices;
+   uint candidateCount;
+   uint indexCount;
+};
+
+layout(push_constant, scalar) uniform Push { GenRoot root; };
+
+void main()
+{
+   uint n = 0u;
+   for (uint i = 0u; i < root.candidateCount; i++) {
+      Candidate c = root.candidates.c[i];
+      if (c.visible == 0u)
+         continue;
+
+      root.args.a[n] = DrawArgs(root.indexCount, c.instanceCount, 0u, 0,
+                                c.firstInstance);
+      root.vsRoots.r[n].vertices = root.vertices;
+      root.vsRoots.r[n].instanceStep = c.instanceStep;
+      root.vsRoots.r[n].z = 0.0;
+      root.psRoots.r[n].tint = c.tint;
+      n++;
+   }
+   root.count.v = n;
+}

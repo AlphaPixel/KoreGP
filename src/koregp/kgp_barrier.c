@@ -110,11 +110,10 @@ kgpBarrier(KgpCommandBuffer cb, KGP_STAGE src, KGP_STAGE dst,
        *
        * NVK_BARRIER_INVALIDATE_CONSTANT only with indirect arguments, as in
        * NVK: an indirect dispatch has the GPU rewrite the group counts
-       * inside a constant buffer (the root record). Otherwise not: under
-       * root convention v0 the root record is the only constant buffer and
-       * is written fresh per dispatch, exactly like NVK's root table, and
-       * the user's root struct is read with global loads. With root v1 the
-       * constant cache becomes a hazard of its own (delta D7).
+       * inside a constant buffer (the root record). Otherwise not: the
+       * root record is the only constant buffer and is written fresh per
+       * dispatch, exactly like NVK's root table, and the user's root
+       * struct is read with global loads (delta D7).
        */
       P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES_NO_WFI, {
          .global_data = dst_cs,

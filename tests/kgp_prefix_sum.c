@@ -10,9 +10,7 @@
 #define MAX_PASSES 32
 
 /* Matches ScanRoot in shaders/prefix_sum.comp (scalar layout), padded so
- * every element of an array of them is 64-byte aligned: root convention v1
- * (KGP_DEBUG=rootv1) binds the root struct as a constant buffer, which the
- * hardware wants aligned.
+ * every element of an array of them is 64-byte aligned.
  */
 struct scan_root {
    uint64_t src;

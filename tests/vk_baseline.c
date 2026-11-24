@@ -11,6 +11,7 @@
 #include "saxpy_spv.h"
 #include "scratch_oracle.h"
 #include "scratch_spv.h"
+#include "tri_mrt_ps_spv.h"
 #include "tri_ps_spv.h"
 #include "tri_scene.h"
 #include "tri_vs_spv.h"
@@ -315,22 +316,33 @@ run_indirect(struct vkc *c)
  * transfer queue so that NVK uses the copy engine.
  */
 static int
-run_copy(struct vkc *c, bool linear)
+run_copy(struct vkc *c, const char *variant)
 {
-   struct vkc_buffer sb = vkc_buffer_create(c, COPY_BYTES);
-   struct vkc_buffer mb = vkc_buffer_create(c, COPY_BYTES);
-   struct vkc_buffer ob = vkc_buffer_create(c, COPY_OUT_BYTES);
-   copy_fill(sb.map);
-   memset(ob.map, 0, COPY_OUT_BYTES);
+   /* The variants of tests/kgp_copy.c (copy_pattern.h). */
+   const bool linear = strcmp(variant, "linear") == 0;
+   const bool mip = strcmp(variant, "mip") == 0;
+   const bool layer = strcmp(variant, "layer") == 0;
+   const bool vol = strcmp(variant, "3d") == 0;
+   const uint32_t level = mip ? COPY_MIP : 0;
+   const uint32_t slices = vol ? COPY_SLICES : 1;
+   const uint32_t rows = COPY_H * slices;
+   const size_t bytes = (size_t)COPY_W * rows * 4;
+   const size_t out_bytes = (size_t)COPY_OUT_ROW_TEXELS * rows * 4;
+
+   struct vkc_buffer sb = vkc_buffer_create(c, bytes);
+   struct vkc_buffer mb = vkc_buffer_create(c, bytes);
+   struct vkc_buffer ob = vkc_buffer_create(c, out_bytes);
+   copy_fill_rows(sb.map, rows);
+   memset(ob.map, 0, out_bytes);
 
    VkImage image;
    VK_OK(vkCreateImage(c->dev, &(VkImageCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-      .imageType = VK_IMAGE_TYPE_2D,
+      .imageType = vol ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
       .format = VK_FORMAT_R8G8B8A8_UNORM,
-      .extent = { COPY_W, COPY_H, 1 },
-      .mipLevels = 1,
-      .arrayLayers = 1,
+      .extent = { COPY_W << level, COPY_H << level, slices },
+      .mipLevels = mip ? COPY_MIPS : 1,
+      .arrayLayers = layer ? COPY_LAYERS : 1,
       .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = linear ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
       .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -349,7 +361,10 @@ run_copy(struct vkc *c, bool linear)
    VK_OK(vkBindImageMemory(c->dev, image, image_mem, 0));
 
    const VkImageSubresourceLayers layers = {
-      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1,
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .mipLevel = level,
+      .baseArrayLayer = layer ? COPY_LAYER : 0,
+      .layerCount = 1,
    };
    const VkMemoryBarrier wrote = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -366,7 +381,8 @@ run_copy(struct vkc *c, bool linear)
       .image = image,
       .subresourceRange = {
          .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-         .levelCount = 1, .layerCount = 1,
+         .levelCount = VK_REMAINING_MIP_LEVELS,
+         .layerCount = VK_REMAINING_ARRAY_LAYERS,
       },
    };
 
@@ -375,7 +391,7 @@ run_copy(struct vkc *c, bool linear)
 
    /* kgpMemCpy */
    vkCmdCopyBuffer(cmd, sb.buffer, mb.buffer, 1,
-                   &(VkBufferCopy) { .size = COPY_BYTES });
+                   &(VkBufferCopy) { .size = bytes });
    /* kgpBarrier(TRANSFER, TRANSFER) */
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
@@ -385,7 +401,7 @@ run_copy(struct vkc *c, bool linear)
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                           &(VkBufferImageCopy) {
                              .imageSubresource = layers,
-                             .imageExtent = { COPY_W, COPY_H, 1 },
+                             .imageExtent = { COPY_W, COPY_H, slices },
                           });
    /* kgpBarrier(TRANSFER, TRANSFER) */
    layout.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -401,7 +417,7 @@ run_copy(struct vkc *c, bool linear)
                           &(VkBufferImageCopy) {
                              .bufferRowLength = COPY_OUT_ROW_TEXELS,
                              .imageSubresource = layers,
-                             .imageExtent = { COPY_W, COPY_H, 1 },
+                             .imageExtent = { COPY_W, COPY_H, slices },
                           });
    /* The wait half of kgpBarrier(TRANSFER, COMPUTE). */
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -414,9 +430,10 @@ run_copy(struct vkc *c, bool linear)
    if (kgp_test_offline()) {
       printf("vk copy: recorded and submitted (offline)\n");
    } else {
-      ret = copy_check("vk copied back", ob.map, COPY_OUT_ROW_TEXELS);
+      ret = copy_check_rows("vk copied back", ob.map, COPY_OUT_ROW_TEXELS,
+                            rows);
       if (ret == 0)
-         printf("vk copy: %u texels correct\n", COPY_W * COPY_H);
+         printf("vk copy: %u texels correct\n", COPY_W * rows);
    }
 
    vkDestroyImage(c->dev, image, NULL);
@@ -444,13 +461,26 @@ shader_module(struct vkc *c, const uint32_t *spirv, size_t size)
  * The two root pointers are a 16-byte push-constant block.
  */
 static int
-run_triangle(struct vkc *c, bool indirect, int scene)
+run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
+             uint32_t bench_cbs, uint32_t bench_draws)
 {
+   static const VkFormat target_formats[TRI_TARGET_COUNT] = {
+      [TRI_TARGET_RGBA8] = VK_FORMAT_R8G8B8A8_UNORM,
+      [TRI_TARGET_SRGB8] = VK_FORMAT_R8G8B8A8_SRGB,
+      [TRI_TARGET_RGBA16F] = VK_FORMAT_R16G16B16A16_SFLOAT,
+      [TRI_TARGET_RGBA32F] = VK_FORMAT_R32G32B32A32_SFLOAT,
+      [TRI_TARGET_R32F] = VK_FORMAT_R32_SFLOAT,
+   };
+   const uint32_t bpp = tri_targets[tfmt].bpp;
+
    /* "depth" here: has a depth target and more than one draw. */
-   const bool depth = scene != TRI_SCENE_PLAIN;
+   const bool mrt = scene == TRI_SCENE_MRT;
+   const bool depth = scene != TRI_SCENE_PLAIN && !mrt;
    const bool stencil = scene == TRI_SCENE_STENCIL;
+   const bool state = scene == TRI_SCENE_STATE;
    const unsigned draws = scene == TRI_SCENE_DEPTH ? TRI_DEPTH_DRAWS :
-                          stencil ? TRI_STENCIL_DRAWS : 1;
+                          stencil ? TRI_STENCIL_DRAWS :
+                          state ? TRI_STATE_DRAWS : 1;
 
    struct vkc_buffer ab =
       vkc_buffer_create(c, sizeof(VkDrawIndexedIndirectCommand));
@@ -465,7 +495,7 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       vkc_buffer_create(c, TRI_DEPTH_DRAWS * sizeof(struct tri_vs_root));
    struct vkc_buffer prb =
       vkc_buffer_create(c, TRI_DEPTH_DRAWS * sizeof(struct tri_ps_root));
-   struct vkc_buffer ob = vkc_buffer_create(c, TRI_W * TRI_H * 4);
+   struct vkc_buffer ob = vkc_buffer_create(c, TRI_W * TRI_H * bpp);
    tri_fill(vb.map, ib.map);
    *(struct tri_vs_root *)vrb.map = (struct tri_vs_root) {
       .vertices = vb.addr, .instance_step = TRI_INSTANCE_STEP,
@@ -473,7 +503,12 @@ run_triangle(struct vkc *c, bool indirect, int scene)
    *(struct tri_ps_root *)prb.map = (struct tri_ps_root) {
       .tint = TRI_TINT_RGBA,
    };
-   for (unsigned d = 0; depth && d < TRI_DEPTH_DRAWS; d++) {
+   _Static_assert(TRI_BENCH_ROOTS <= TRI_DEPTH_DRAWS, "room for the roots");
+   for (unsigned d = 1; bench_cbs > 0 && d < TRI_BENCH_ROOTS; d++) {
+      ((struct tri_vs_root *)vrb.map)[d] = *(struct tri_vs_root *)vrb.map;
+      ((struct tri_ps_root *)prb.map)[d] = *(struct tri_ps_root *)prb.map;
+   }
+   for (unsigned d = 0; depth && !state && d < TRI_DEPTH_DRAWS; d++) {
       struct tri_vs_root *vr = (struct tri_vs_root *)vrb.map + d;
       struct tri_ps_root *pr = (struct tri_ps_root *)prb.map + d;
       *vr = (struct tri_vs_root) {
@@ -483,7 +518,17 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       };
       memcpy(pr->tint, tri_depth_draws[d].tint, sizeof(pr->tint));
    }
-   memset(ob.map, 0, TRI_W * TRI_H * 4);
+   for (unsigned d = 0; state && d < TRI_STATE_DRAWS; d++) {
+      struct tri_vs_root *vr = (struct tri_vs_root *)vrb.map + d;
+      struct tri_ps_root *pr = (struct tri_ps_root *)prb.map + d;
+      *vr = (struct tri_vs_root) {
+         .vertices = vb.addr,
+         .instance_step = tri_state_draws[d].instance_step,
+         .z = tri_state_draws[d].z,
+      };
+      memcpy(pr->tint, tri_state_draws[d].tint, sizeof(pr->tint));
+   }
+   memset(ob.map, 0, TRI_W * TRI_H * bpp);
 
    /* The depth target of the "depth" variant. TRANSFER_DST keeps NVK from
     * giving it a ZCULL plane; KoreGP has no ZCULL at all (see the awk
@@ -530,7 +575,7 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       }, NULL, &depth_view));
    }
 
-   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkFormat format = target_formats[tfmt];
    VkImage image;
    VK_OK(vkCreateImage(c->dev, &(VkImageCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -567,6 +612,42 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       .subresourceRange = range,
    }, NULL, &view));
 
+   /* The mrt variant's second target: the same again. */
+   VkImage image1 = VK_NULL_HANDLE;
+   VkDeviceMemory image1_mem = VK_NULL_HANDLE;
+   VkImageView view1 = VK_NULL_HANDLE;
+   struct vkc_buffer ob1 = vkc_buffer_create(c, TRI_W * TRI_H * 4);
+   memset(ob1.map, 0, TRI_W * TRI_H * 4);
+   if (mrt) {
+      VK_OK(vkCreateImage(c->dev, &(VkImageCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = format,
+         .extent = { TRI_W, TRI_H, 1 },
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      }, NULL, &image1));
+      VK_OK(vkAllocateMemory(c->dev, &(VkMemoryAllocateInfo) {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = reqs.size,
+         .memoryTypeIndex = __builtin_ctz(reqs.memoryTypeBits),
+      }, NULL, &image1_mem));
+      VK_OK(vkBindImageMemory(c->dev, image1, image1_mem, 0));
+      VK_OK(vkCreateImageView(c->dev, &(VkImageViewCreateInfo) {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = image1,
+         .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = format,
+         .subresourceRange = range,
+      }, NULL, &view1));
+   }
+   const uint32_t color_count = mrt ? 2 : 1;
+   const VkFormat formats[2] = { format, format };
+
    VkPipelineLayout layout;
    VK_OK(vkCreatePipelineLayout(c->dev, &(VkPipelineLayoutCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -579,7 +660,9 @@ run_triangle(struct vkc *c, bool indirect, int scene)
    }, NULL, &layout));
 
    VkShaderModule vs = shader_module(c, tri_vs_spv, sizeof(tri_vs_spv));
-   VkShaderModule ps = shader_module(c, tri_ps_spv, sizeof(tri_ps_spv));
+   VkShaderModule ps = mrt
+      ? shader_module(c, tri_mrt_ps_spv, sizeof(tri_mrt_ps_spv))
+      : shader_module(c, tri_ps_spv, sizeof(tri_ps_spv));
    const VkPipelineShaderStageCreateInfo stages[2] = {
       {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -599,8 +682,10 @@ run_triangle(struct vkc *c, bool indirect, int scene)
     */
    VkPipeline pipelines[TRI_DEPTH_DRAWS] = { VK_NULL_HANDLE };
    for (unsigned d = 0; d < draws; d++) {
-   const bool depth_on = scene == TRI_SCENE_DEPTH && d < 2;
+   const bool depth_on = (scene == TRI_SCENE_DEPTH && d < 2) || state;
    const bool blend_on = scene == TRI_SCENE_DEPTH && d != 1;
+   /* The state variant's draw 0: bias, constant-factor blend, no green. */
+   const bool state0 = state && d == 0;
    const VkStencilOpState stencil_state = {
       .passOp = stencil && d == 0 ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
       .compareOp = !stencil ? VK_COMPARE_OP_NEVER :
@@ -614,8 +699,8 @@ run_triangle(struct vkc *c, bool indirect, int scene)
          .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
          .pNext = &(VkPipelineRenderingCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-            .colorAttachmentCount = 1,
-            .pColorAttachmentFormats = &format,
+            .colorAttachmentCount = color_count,
+            .pColorAttachmentFormats = formats,
             .depthAttachmentFormat = depth ? depth_format
                                            : VK_FORMAT_UNDEFINED,
             .stencilAttachmentFormat = stencil ? depth_format
@@ -640,6 +725,9 @@ run_triangle(struct vkc *c, bool indirect, int scene)
             .polygonMode = VK_POLYGON_MODE_FILL,
             .cullMode = VK_CULL_MODE_NONE,
             .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            .depthBiasEnable = state0,
+            .depthBiasConstantFactor = state0 ? TRI_STATE_BIAS : 0.0f,
+            .depthBiasSlopeFactor = state0 ? TRI_STATE_BIAS_SLOPE : 0.0f,
             .lineWidth = 1.0f,
          },
          .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo) {
@@ -658,18 +746,32 @@ run_triangle(struct vkc *c, bool indirect, int scene)
          },
          .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-            .attachmentCount = 1,
-            .pAttachments = &(VkPipelineColorBlendAttachmentState) {
-               .blendEnable = blend_on,
-               .srcColorBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
-               .dstColorBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
-               .srcAlphaBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
-               .dstAlphaBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
-               .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
-                                 VK_COLOR_COMPONENT_G_BIT |
-                                 VK_COLOR_COMPONENT_B_BIT |
-                                 VK_COLOR_COMPONENT_A_BIT,
+            .attachmentCount = color_count,
+            .pAttachments = (VkPipelineColorBlendAttachmentState[2]) {
+               {
+                  .blendEnable = blend_on || state0,
+                  .srcColorBlendFactor =
+                     state0 ? VK_BLEND_FACTOR_CONSTANT_COLOR :
+                     blend_on ? VK_BLEND_FACTOR_ONE : 0,
+                  .dstColorBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
+                  .srcAlphaBlendFactor =
+                     state0 ? VK_BLEND_FACTOR_CONSTANT_ALPHA :
+                     blend_on ? VK_BLEND_FACTOR_ONE : 0,
+                  .dstAlphaBlendFactor = blend_on ? VK_BLEND_FACTOR_ONE : 0,
+                  .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                    (state0 ? 0 : VK_COLOR_COMPONENT_G_BIT) |
+                                    VK_COLOR_COMPONENT_B_BIT |
+                                    VK_COLOR_COMPONENT_A_BIT,
+               },
+               /* The mrt variant's second target: no blue. */
+               {
+                  .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                    VK_COLOR_COMPONENT_G_BIT |
+                                    VK_COLOR_COMPONENT_A_BIT,
+               },
             },
+            .blendConstants = { state0 ? 1.0f : 0.0f, state0 ? 1.0f : 0.0f,
+                                0.0f, state0 ? 1.0f : 0.0f },
          },
          .layout = layout,
       }, NULL, &pipelines[d]));
@@ -686,12 +788,76 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       .subresourceRange = range,
    };
    const VkDeviceAddress roots[2] = { vrb.addr, prb.addr };
+   int ret = 0;
 
    VkCommandBuffer cmd = vkc_cmd_alloc(c);
+   if (bench_cbs > 0) {
+      const VkRenderingInfo rendering = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+         .renderArea = area,
+         .layerCount = 1,
+         .colorAttachmentCount = 1,
+         .pColorAttachments = &(VkRenderingAttachmentInfo) {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue.color.float32 = TRI_CLEAR_RGBA,
+         },
+      };
+      uint64_t record_ns = 0, submit_ns = 0;
+      for (uint32_t i = 0; i < TRI_BENCH_WARMUP + bench_cbs; i++) {
+         const uint64_t t0 = tri_cpu_ns();
+         vkc_cmd_begin(cmd);
+         if (i == 0) {   /* the layout, once; not timed */
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &to_target);
+         }
+         vkCmdBeginRendering(cmd, &rendering);
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[0]);
+         vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+         for (uint32_t j = 0; j < bench_draws; j++) {
+            const VkDeviceSize r = j % TRI_BENCH_ROOTS;
+            const VkDeviceAddress draw_roots[2] = {
+               vrb.addr + r * sizeof(struct tri_vs_root),
+               prb.addr + r * sizeof(struct tri_ps_root),
+            };
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT |
+                               VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(draw_roots), draw_roots);
+            vkCmdDrawIndexed(cmd, TRI_INDEX_COUNT, TRI_INSTANCE_COUNT, 0, 0, 0);
+         }
+         vkCmdEndRendering(cmd);
+         VK_OK(vkEndCommandBuffer(cmd));
+         const uint64_t t1 = tri_cpu_ns();
+         VK_OK(vkQueueSubmit(c->queue, 1, &(VkSubmitInfo) {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &cmd,
+         }, VK_NULL_HANDLE));
+         const uint64_t t2 = tri_cpu_ns();
+         VK_OK(vkQueueWaitIdle(c->queue));
+         if (i >= TRI_BENCH_WARMUP) {
+            record_ns += t1 - t0;
+            submit_ns += t2 - t1;
+         }
+      }
+      tri_bench_report("vk", bench_cbs, bench_draws, record_ns, submit_ns);
+      goto cleanup;
+   }
    vkc_cmd_begin(cmd);
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                         0, NULL, 0, NULL, 1, &to_target);
+   if (mrt) {
+      VkImageMemoryBarrier to_target1 = to_target;
+      to_target1.image = image1;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                           0, NULL, 0, NULL, 1, &to_target1);
+   }
    if (depth) {
       VkImageMemoryBarrier to_depth = to_target;
       to_depth.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
@@ -707,14 +873,24 @@ run_triangle(struct vkc *c, bool indirect, int scene)
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
       .renderArea = area,
       .layerCount = 1,
-      .colorAttachmentCount = 1,
-      .pColorAttachments = &(VkRenderingAttachmentInfo) {
-         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-         .imageView = view,
-         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-         .clearValue.color.float32 = TRI_CLEAR_RGBA,
+      .colorAttachmentCount = color_count,
+      .pColorAttachments = (VkRenderingAttachmentInfo[2]) {
+         {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue.color.float32 = TRI_CLEAR_RGBA,
+         },
+         {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = view1,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue.color.float32 = TRI_MRT_CLEAR1_RGBA,
+         },
       },
       .pDepthAttachment = !depth ? NULL : &(VkRenderingAttachmentInfo) {
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -783,18 +959,38 @@ run_triangle(struct vkc *c, bool indirect, int scene)
                              },
                              .imageExtent = { TRI_W, TRI_H, 1 },
                           });
+   if (mrt) {
+      to_source.image = image1;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           0, NULL, 0, NULL, 1, &to_source);
+      vkCmdCopyImageToBuffer(cmd, image1,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             ob1.buffer, 1,
+                             &(VkBufferImageCopy) {
+                                .imageSubresource = {
+                                   .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                   .layerCount = 1,
+                                },
+                                .imageExtent = { TRI_W, TRI_H, 1 },
+                             });
+   }
    vkc_cmd_submit(c, cmd);
    VK_OK(vkQueueWaitIdle(c->queue));
 
-   int ret = 0;
    if (kgp_test_offline()) {
       printf("vk triangle: recorded and submitted (offline)\n");
    } else {
-      ret = tri_check("vk triangle", ob.map, TRI_W, scene);
+      ret = tfmt != TRI_TARGET_RGBA8
+         ? tri_check_target("vk triangle", ob.map, tfmt)
+         : tri_check("vk triangle", ob.map, TRI_W, scene);
+      if (ret == 0 && mrt)
+         ret = tri_check_mrt1("vk triangle", ob1.map);
       if (ret == 0)
          printf("vk triangle: %ux%u pixels correct\n", TRI_W, TRI_H);
    }
 
+cleanup:
    for (unsigned d = 0; d < TRI_DEPTH_DRAWS; d++)
       vkDestroyPipeline(c->dev, pipelines[d], NULL);
    vkDestroyImageView(c->dev, depth_view, NULL);
@@ -803,6 +999,10 @@ run_triangle(struct vkc *c, bool indirect, int scene)
    vkDestroyShaderModule(c->dev, ps, NULL);
    vkDestroyShaderModule(c->dev, vs, NULL);
    vkDestroyPipelineLayout(c->dev, layout, NULL);
+   vkDestroyImageView(c->dev, view1, NULL);
+   vkDestroyImage(c->dev, image1, NULL);
+   vkFreeMemory(c->dev, image1_mem, NULL);
+   vkc_buffer_destroy(c, &ob1);
    vkDestroyImageView(c->dev, view, NULL);
    vkDestroyImage(c->dev, image, NULL);
    vkFreeMemory(c->dev, image_mem, NULL);
@@ -820,7 +1020,9 @@ main(int argc, char **argv)
 {
    if (argc < 2) {
       fprintf(stderr, "usage: %s saxpy|prefix_sum|scratch|indirect|"
-              "copy [linear]|triangle [indirect|depth|stencil]\n", argv[0]);
+              "copy [linear|mip|layer|3d]|"
+              "triangle [indirect|depth|stencil|state|mrt|<format>|"
+              "bench [command buffers] [draws]]\n", argv[0]);
       return 2;
    }
    const bool copy = strcmp(argv[1], "copy") == 0;
@@ -830,7 +1032,7 @@ main(int argc, char **argv)
 
    int ret = 2;
    if (copy)
-      ret = run_copy(&c, argc > 2 && strcmp(argv[2], "linear") == 0);
+      ret = run_copy(&c, argc > 2 ? argv[2] : "");
    else if (strcmp(argv[1], "saxpy") == 0)
       ret = run_saxpy(&c);
    else if (strcmp(argv[1], "prefix_sum") == 0)
@@ -839,12 +1041,23 @@ main(int argc, char **argv)
       ret = run_scratch(&c);
    else if (strcmp(argv[1], "indirect") == 0)
       ret = run_indirect(&c);
+   else if (strcmp(argv[1], "triangle") == 0 && argc > 2 &&
+            strcmp(argv[2], "bench") == 0)
+      ret = run_triangle(&c, false, TRI_SCENE_PLAIN, TRI_TARGET_RGBA8,
+                         argc > 3 ? strtoul(argv[3], NULL, 0) : 1000,
+                         argc > 4 ? strtoul(argv[4], NULL, 0) : 100);
    else if (strcmp(argv[1], "triangle") == 0)
       ret = run_triangle(&c, argc > 2 && strcmp(argv[2], "indirect") == 0,
                          argc > 2 && strcmp(argv[2], "depth") == 0
                             ? TRI_SCENE_DEPTH :
                          argc > 2 && strcmp(argv[2], "stencil") == 0
-                            ? TRI_SCENE_STENCIL : TRI_SCENE_PLAIN);
+                            ? TRI_SCENE_STENCIL :
+                         argc > 2 && strcmp(argv[2], "state") == 0
+                            ? TRI_SCENE_STATE :
+                         argc > 2 && strcmp(argv[2], "mrt") == 0
+                            ? TRI_SCENE_MRT : TRI_SCENE_PLAIN,
+                         tri_target_from_arg(argc > 2 ? argv[2] : NULL),
+                         0, 0);
 
    vkc_finish(&c);
    return ret;

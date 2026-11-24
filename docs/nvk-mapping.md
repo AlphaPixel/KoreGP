@@ -161,8 +161,9 @@ Natively:
    load (`phys_ssbo_addr_format = nir_address_format_64bit_global`, as NVK
    configures it). One indirection. A push-constant block larger than the one
    pointer is rejected at pipeline creation, as are descriptor-set resources.
-2. **v1 (implemented behind `KGP_DEBUG=rootv1`; correct on hardware, no
-   GPU-time difference on the one memory-bound shader measured, undecided):** bind
+2. **v1 (was implemented behind `KGP_DEBUG=rootv1`; correct on hardware,
+   measured in three windows, not adopted, and removed on 2026-11-24:
+   `results-n1.md`):** bind
    the *user's root struct itself* as cbuf 2. The QMD takes `{index, addr,
    size}` per cbuf, so reads of root fields become `c2[offset]` with no
    pointer chase — and on NVIDIA a cbuf value can be an instruction operand,
@@ -371,7 +372,8 @@ global loads, which the ordinary shader-data flush covers. So v0 needs no new
 hazard bit and `kgpBarrier` does not touch the constant cache. Once the user's
 root struct is itself bound as a constant buffer (v1), rewriting it in place
 between dispatches does need the invalidate: either a `KGP_HAZARD_ROOT_DATA`
-bit or `nak_set_invalidate_cache` per QMD. Decide with N1.H.
+bit or `nak_set_invalidate_cache` per QMD. N1.H decided it: v1 was not
+adopted, so the hazard bit is not needed.
 
 Split barriers: `WAIT_FOR_IDLE` plus a GPU-side semaphore write is the likely
 form *(verify at N3+)*.
@@ -415,8 +417,8 @@ The API is four calls (`kgpCreateSwapchain`, `kgpAcquireSwapchainTexture`,
 | D2 | `kgpSetActiveSamplerHeapPtr`; both heap setters take a count | separate sampler pool, pools have sizes |
 | D3 | sampler descriptor is `KgpDescriptor256` | TSC is 32 bytes |
 | D4 | none for colour textures (hardware, 2026-11-21); for depth/MSAA, possibly: size/align query returns a memory kind and allocation accepts it | PTE kind |
-| D5 | SPIR-V root ABI fixed as push-constant-held pointer; root alignment 64 B if v1 | no SGPRs |
-| D7 | possibly `KGP_HAZARD_ROOT_DATA`, only with root v1 | constant-buffer cache |
+| D5 | SPIR-V root ABI fixed as push-constant-held pointer (the 64-byte root alignment was v1's, which was not adopted) | no SGPRs |
+| D7 | none: `KGP_HAZARD_ROOT_DATA` would have been needed only with root v1 | constant-buffer cache |
 | D10 | none: raster root pointers are push-constant offsets 0 (vertex) and 8 (pixel), as D5 already says | hardware root tables |
 
 Smaller choices the N1 header made where the proposal's sketch was silent:
@@ -432,15 +434,25 @@ the proposal's claim that the model is vendor-neutral; D2–D4 are exactly the
 ## §7 Validation and tooling
 
 - `KGP_DEBUG=1` checks: vendor-neutral, and written (`kgp_validate.c`,
-  test `kgp_validate`) except for the NIR-injected bounds checks on heap
-  indexing. Two things differ from the proposal's wording:
+  test `kgp_validate`), the NIR-injected bounds checks on heap indexing
+  included since 2026-11-24 (`kgp_nir_lower_heap.c`; they have not run on
+  a GPU). A pipeline created under validation compares each heap index
+  with the number of entries the command buffer gave the heap, and skips
+  the access when it is past the end: a read gives zero, a write is
+  dropped. The two counts reach a compute shader in the root record and a
+  raster shader behind its root pointers, so a command buffer that uses
+  textures under validation has to set its heaps itself; relying on an
+  earlier command buffer's reads as an empty heap. On this hardware the
+  texture header pool has a size register too (`SET_TEX_HEADER_POOL_C`);
+  what the GPU does with an index past it is not known here, and the
+  check does not depend on it. Two things differ from the proposal's
+  wording:
   - There is no dispatch table to interpose; the entry points are plain
     exported functions. Each one that takes a GPU pointer has one branch
     on a flag of the command buffer, and the mode costs nothing more when
     off (dispatch recording stays at 49 ns offline; 60 ns with it on).
-  - "Root-pointer alignment" has no number in the proposal. Under root
-    convention v0 the check is 4 bytes (NAK loads through a root in 32-bit
-    words); v1 already required 64 without the mode.
+  - "Root-pointer alignment" has no number in the proposal. The check is
+    4 bytes (NAK loads through a root in 32-bit words).
   What it checks: every GPU pointer argument is inside live `kgpMalloc`
   memory, with the bytes the call will touch where the CPU knows them
   (copies, heaps of `count` entries, direct index counts, textures); the

@@ -6,11 +6,23 @@
 
 // Reads every texel of a texture chosen by index into the texture heap and
 // writes it, packed, to plain memory where the CPU can check it.
+//
+// Compiled three times (tests/meson.build): as is for a 2D texture, with
+// FETCH_ARRAY for one layer of a 2D array, and with FETCH_3D for every
+// slice of a 3D texture (one dispatch group in z per slice).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#if defined(FETCH_ARRAY)
+#define TEXTURE_TYPE texture2DArray
+#elif defined(FETCH_3D)
+#define TEXTURE_TYPE texture3D
+#else
+#define TEXTURE_TYPE texture2D
+#endif
+
 // The KoreGP heap convention: set 0, binding 0.
-layout(set = 0, binding = 0) uniform texture2D kgpTextures[];
+layout(set = 0, binding = 0) uniform TEXTURE_TYPE kgpTextures[];
 
 layout(buffer_reference, scalar) buffer UintArray { uint v[]; };
 
@@ -19,16 +31,25 @@ layout(buffer_reference, scalar) readonly buffer HeapFetchRoot {
    uint textureIndex;
    uint width;
    uint height;
+   uint layer;       // FETCH_ARRAY only
 };
 
 layout(push_constant, scalar) uniform Push { HeapFetchRoot root; };
 
 void main()
 {
-   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+   ivec3 p = ivec3(gl_GlobalInvocationID);
    if (p.x >= int(root.width) || p.y >= int(root.height))
       return;
 
+#if defined(FETCH_ARRAY)
+   vec4 t = texelFetch(kgpTextures[root.textureIndex],
+                       ivec3(p.xy, int(root.layer)), 0);
+#elif defined(FETCH_3D)
    vec4 t = texelFetch(kgpTextures[root.textureIndex], p, 0);
-   root.dst.v[p.y * int(root.width) + p.x] = packUnorm4x8(t);
+#else
+   vec4 t = texelFetch(kgpTextures[root.textureIndex], p.xy, 0);
+#endif
+   root.dst.v[(p.z * int(root.height) + p.y) * int(root.width) + p.x] =
+      packUnorm4x8(t);
 }

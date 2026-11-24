@@ -231,10 +231,15 @@ run on hardware.
 | `kgp_info` | device open through nvkmd with no Vulkan object (D8) |
 | `kgp_saxpy`, `kgp_prefix_sum`, `kgp_scratch`, `kgp_indirect` | SPIR-V → NIR → NAK with the root convention; memory, pointers, pipelines, recording, barriers, indirect dispatch, multi-buffer submit, semaphores all run |
 | `kgp_reject` | bad SPIR-V, an oversized push-constant block, descriptor-set resources, bad sizes, pointers and submits are refused with an error, not a crash |
-| `kgp_validate` | Under `KGP_DEBUG=1`: a CPU pointer as a root, a misaligned root, copies one byte past an allocation, a heap larger than its memory, barriers with empty or unknown stages, a texture over memory too small for it and a command buffer whose memory was freed before submit are all refused; correct use of the same calls is not |
+| `kgp_validate` | (Since 2026-11-24 also the shader-side heap bounds check, which no window has run.) Under `KGP_DEBUG=1`: a CPU pointer as a root, a misaligned root, copies one byte past an allocation, a heap larger than its memory, barriers with empty or unknown stages, a texture over memory too small for it and a command buffer whose memory was freed before submit are all refused; correct use of the same calls is not |
 | `vk_saxpy`, `vk_prefix_sum`, `vk_scratch`, `vk_indirect` | the Vulkan twins build and run on the same NVK |
 | `push_matches_nvk_*` (4) | **KoreGP pushes exactly what NVK pushes** |
 | `no_bind_per_submit` | 4 VA binds whether 8 or 800 command buffers are submitted |
+| `kgp_triangle state`, `vk_triangle_state`, `triangle_matches_nvk_state` | added 2026-11-24, offline only so far. Depth bias, a colour write mask and a blend with constant factors, set for the first draw and unset for the second; from the render pass to the first draw KoreGP's methods are NVK's, the bias, the factors, the mask and the constant included |
+| `kgp_copy mip`, `layer`, `3d`, their `vk_copy_*` twins and `push_matches_nvk_copy_*` | added 2026-11-24, offline only so far. The copy chain on mip level 1 of a three-level texture, on layer 2 of a three-layer array and on all four slices of a 3D texture. The copy engine's methods are NVK's in each case (50, 50 and 146 of them); addresses are masked in that comparison, so where a level or a layer starts is checked only on hardware, by a shader reading the texture through its own type (`texture2DArray`, `texture3D`, or a one-level view) |
+| `kgp_triangle srgb`, `rgba16f`, `rgba32f`, `r32f`, their `vk_triangle_*` twins and `triangle_matches_nvk_*` | added 2026-11-24, offline only so far. The plain triangle scene into a render target of each format, read back at its own texel size; from the render pass to the draw KoreGP's methods are NVK's, the target format among them |
+| `kgp_triangle mrt`, `vk_triangle_mrt`, `triangle_matches_nvk_mrt` | added 2026-11-24, offline only so far, and the first test to draw into more than one colour target. Two targets, a pixel shader with two outputs, the second target through a per-target write mask (`KgpRasterDesc::colorWrite`); KoreGP's methods are NVK's, the six unused target slots, the target selection and the combined mask among them |
+| `kgp_triangle multigpu` | added 2026-11-24, offline only so far. A compute shader turns four candidate draws into the three records, the count and the per-draw root structs of a multi-draw later in the same command buffer; recorded and submitted. No twin: Vulkan has no spelling for per-draw root data |
 
 Every dispatch in the suite also checks, by assertion, that the QMD built
 from the pipeline's template is byte-identical to the one NAK builds.
@@ -318,10 +323,61 @@ cleverness in the frontend, it is state the API no longer has.
   comparison is against the driver as it is.
 - One shader, one shape. No statement yet about anything but compute dispatch.
 
-## Root convention v1 (experimental)
+## Draw cost, offline
 
-Plan task N1.H, implemented behind `KGP_DEBUG=rootv1` so both conventions can
-be measured in one hardware window. v0 gives the shader the root *pointer*
+Measured 2026-11-24, on the shim, release build; not yet on hardware (the
+suite's `bench_draw` step runs it in the next window).
+
+`kgp_triangle bench` and `vk_baseline triangle bench` (`tests/tri_scene.h`):
+N command buffers, each one render pass with a clear, the pipeline set
+once and M draws of the triangle test's quad, every draw with its own pair
+of root pointers. A Vulkan draw is `vkCmdPushConstants` (the two pointers)
+plus `vkCmdDrawIndexed`, with the index buffer bound once. Timed like the
+dispatch benchmark.
+
+| | Record, ns per draw (500 x 1000) | User instructions per draw (marginal) |
+|---|---|---|
+| NVK through Vulkan | 58.9 - 59.4 | 660 |
+| KoreGP | 18.9 - 19.0 | 218 |
+
+Instructions are marginal as above: 2000 command buffers of 600 draws
+against 2000 of 100. At 100 draws per command buffer the per-buffer work
+(render pass, state, shaders) is a larger share and the times are 29 - 44
+ns against 80 - 112 ns.
+
+The ratio is about three, less than for dispatches, and for a different
+reason. Per draw the two send the GPU almost the same thing: the draw
+macro with its five parameters, and the root pointers into a hardware root
+table (KoreGP one load of four words, NVK two loads of six). Nothing like
+the QMD is rebuilt per draw on either side. What NVK executes and KoreGP
+does not is bookkeeping: the push constants go into a shadow of the root
+descriptor table that is flushed at the draw, and every draw asks whether
+any dynamic state, descriptor set or vertex buffer is dirty. KoreGP's draw
+has one flag to look at.
+
+One change came out of the measurement. KoreGP rebound the index buffer on
+every draw (five more words and a macro call); it now binds it when the
+address changes or a draw reads further than the last bind allowed, as an
+application calling `vkCmdBindIndexBuffer` once would. That took a draw
+from about 30 ns to about 19.
+
+The figures are of the tree as it stood at the end of 2026-11-24, with the
+validation mode's branch in the draw path (three instructions; the first
+version of the heap bounds checks cost four nanoseconds more by making
+the root write variable-sized, found by this benchmark and undone). A
+dispatch on the same build is 48 ns and 263 instructions, up from the 240
+of the table above by what has been added to it since: the validation
+branch and the two heap counts in the root record.
+
+## Root convention v1 (experimental, removed)
+
+The code was deleted on 2026-11-24 at the owner's decision, with its tests
+and the suite steps that ran it; commit `23992ca` is the last tree that has
+it. This section and the two measurements above are the record of what it
+was and why it was not adopted.
+
+Plan task N1.H, implemented behind `KGP_DEBUG=rootv1` so both conventions
+could be measured in one hardware window. v0 gives the shader the root *pointer*
 (in constant buffer 0) and lets it chase it; v1 additionally binds the
 caller's root struct itself as constant buffer 2, and reads of root fields
 at constant offsets become constant-buffer loads

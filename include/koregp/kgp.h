@@ -274,12 +274,28 @@ typedef enum KGP_CULL {
 
 #define KGP_MAX_COLOR_TARGETS 8
 
+/* Which channels a draw writes. Zero, the value of a zeroed desc, is all
+ * four; NONE is for a draw that is to leave a colour target alone.
+ */
+typedef enum KGP_COLOR_WRITE {
+   KGP_COLOR_WRITE_ALL  = 0,
+   KGP_COLOR_WRITE_R    = 1 << 0,
+   KGP_COLOR_WRITE_G    = 1 << 1,
+   KGP_COLOR_WRITE_B    = 1 << 2,
+   KGP_COLOR_WRITE_A    = 1 << 3,
+   KGP_COLOR_WRITE_NONE = 1 << 4,
+} KGP_COLOR_WRITE;
+
 typedef struct KgpRasterDesc {
    KGP_TOPOLOGY topology;
    KGP_CULL cull;
    uint32_t colorTargetCount;                         /* 1 to 8 */
    KGP_FORMAT colorFormats[KGP_MAX_COLOR_TARGETS];
    KGP_FORMAT depthFormat;     /* KGP_FORMAT_NONE: drawn without a depth target */
+   /* KGP_COLOR_WRITE per colour target. A channel is written if this and
+    * the blend state's colorWrite both allow it.
+    */
+   uint32_t colorWrite[KGP_MAX_COLOR_TARGETS];
 } KgpRasterDesc;
 
 /* A vertex and a pixel shader, SPIR-V 1.3+, entry points "main". There are
@@ -449,6 +465,15 @@ typedef struct KgpDepthStencilDesc {
    uint8_t stencilReadMask;    /* applied to both sides of the compare */
    uint8_t stencilWriteMask;
    uint8_t stencilReference;
+   /* Depth bias, added to a fragment's depth before the test:
+    * depthBias * r + depthBiasSlope * m, where r is the smallest difference
+    * the depth format resolves at the polygon's depth and m the polygon's
+    * largest depth slope. Off when both are zero. depthBiasClamp, when not
+    * zero, bounds the sum (an upper bound if positive, a lower if negative).
+    */
+   float depthBias;
+   float depthBiasSlope;
+   float depthBiasClamp;
 } KgpDepthStencilDesc;
 
 typedef struct KgpDepthStencilState_T *KgpDepthStencilState;
@@ -468,6 +493,10 @@ typedef enum KGP_BLEND_FACTOR {
    KGP_BLEND_INV_SRC_ALPHA,
    KGP_BLEND_DST_ALPHA,
    KGP_BLEND_INV_DST_ALPHA,
+   KGP_BLEND_CONSTANT_COLOR,       /* KgpBlendDesc::constant */
+   KGP_BLEND_INV_CONSTANT_COLOR,
+   KGP_BLEND_CONSTANT_ALPHA,
+   KGP_BLEND_INV_CONSTANT_ALPHA,
 } KGP_BLEND_FACTOR;
 
 typedef enum KGP_BLEND_OP {
@@ -478,12 +507,19 @@ typedef enum KGP_BLEND_OP {
    KGP_BLEND_OP_MAX,
 } KGP_BLEND_OP;
 
-/* One equation, applied to every colour target of the render pass. */
+/* One equation, constant and write mask, applied to every colour target of
+ * the render pass (a pipeline can narrow the mask per target:
+ * KgpRasterDesc::colorWrite). The equation src * ONE + dst * ZERO for both colour and
+ * alpha is no blending at all, and costs nothing: it is how to set a write
+ * mask alone.
+ */
 typedef struct KgpBlendDesc {
    KGP_BLEND_FACTOR srcColor, dstColor;
    KGP_BLEND_OP colorOp;
    KGP_BLEND_FACTOR srcAlpha, dstAlpha;
    KGP_BLEND_OP alphaOp;
+   float constant[4];          /* R, G, B, A for the CONSTANT factors */
+   uint32_t colorWrite;        /* KGP_COLOR_WRITE */
 } KgpBlendDesc;
 
 typedef struct KgpBlendState_T *KgpBlendState;

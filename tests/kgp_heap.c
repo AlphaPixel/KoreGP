@@ -27,9 +27,7 @@
 #define SLOT_A 5u
 #define SLOT_B 9u
 
-/* Root structs match the shaders (scalar layout) and are padded to 64
- * bytes so they are also valid under root convention v1.
- */
+/* Root structs match the shaders (scalar layout), padded to 64 bytes. */
 struct copy_root {
    uint64_t src;
    uint64_t heap;

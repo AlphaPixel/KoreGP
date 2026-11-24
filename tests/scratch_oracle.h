@@ -10,7 +10,7 @@
 #define SCRATCH_GROUPS ((SCRATCH_COUNT + 63) / 64)
 
 /* Matches ScratchRoot (scalar layout), padded to 64 bytes so an array of
- * them keeps every root pointer 64-byte aligned (root convention v1).
+ * them keeps every root pointer 64-byte aligned.
  */
 struct scratch_root {
    uint64_t src;

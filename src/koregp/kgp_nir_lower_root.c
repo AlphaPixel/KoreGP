@@ -1,5 +1,5 @@
 /*
- * The root convention, v0 (delta D5 in docs/nvk-mapping.md).
+ * The root convention (delta D5 in docs/nvk-mapping.md).
  *
  * SPIR-V spells the root pointer as a push-constant block whose first
  * member is a PhysicalStorageBuffer pointer. There are no push constants on
@@ -117,98 +117,6 @@ lower_root_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    nir_def_rewrite_uses(&intrin->def, val);
    nir_instr_remove(&intrin->instr);
    return true;
-}
-
-/* Root convention v1 (experimental, KGP_DEBUG=rootv1; plan task N1.H).
- *
- * v0 leaves the shader chasing the root pointer: one constant-buffer load
- * for the pointer, then global loads for each field of the caller's root
- * struct. v1 binds the root struct itself as constant buffer 2, so a read
- * of a root field at a constant offset becomes a constant-buffer load with
- * no pointer in the way: the NVIDIA counterpart of the proposal's
- * register-preload optimization.
- *
- * Only reads through a `readonly` root block qualify (those arrive as
- * load_global_constant), and only at constant offsets inside one cbuf
- * window. Everything else stays a global load, which remains correct.
- */
-
-/* Is `def` the root pointer plus a constant? Runs after kgp_nir_lower_root,
- * so the root pointer is an ldc_nv of cbuf 0 at offset 0.
- */
-static bool
-root_plus_const(nir_def *def, uint64_t *offset_out)
-{
-   uint64_t offset = 0;
-
-   while (nir_def_instr(def)->type == nir_instr_type_alu) {
-      nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
-      if (alu->op != nir_op_iadd)
-         return false;
-
-      if (nir_src_is_const(alu->src[1].src)) {
-         offset += nir_src_as_uint(alu->src[1].src);
-         def = alu->src[0].src.ssa;
-      } else if (nir_src_is_const(alu->src[0].src)) {
-         offset += nir_src_as_uint(alu->src[0].src);
-         def = alu->src[1].src.ssa;
-      } else {
-         return false;
-      }
-   }
-
-   if (nir_def_instr(def)->type != nir_instr_type_intrinsic)
-      return false;
-   nir_intrinsic_instr *ldc = nir_instr_as_intrinsic(nir_def_instr(def));
-   if (ldc->intrinsic != nir_intrinsic_ldc_nv || def->bit_size != 64 ||
-       !nir_src_is_const(ldc->src[0]) || !nir_src_is_const(ldc->src[1]) ||
-       nir_src_as_uint(ldc->src[0]) != KGP_CBUF_ROOT ||
-       nir_src_as_uint(ldc->src[1]) + nir_intrinsic_base(ldc) != 0)
-      return false;
-
-   *offset_out = offset;
-   return true;
-}
-
-static bool
-lower_root_v1_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
-{
-   uint32_t *size_B = data;
-
-   if (intrin->intrinsic != nir_intrinsic_load_global_constant)
-      return false;
-
-   uint64_t offset;
-   if (!root_plus_const(intrin->src[0].ssa, &offset))
-      return false;
-
-   const uint32_t load_B =
-      intrin->def.num_components * intrin->def.bit_size / 8;
-   if (offset + load_B > KGP_MAX_CBUF_SIZE_B)
-      return false;
-
-   b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *val =
-      nir_ldc_nv(b, intrin->def.num_components, intrin->def.bit_size,
-                 nir_imm_int(b, KGP_CBUF_USER_ROOT), nir_imm_int(b, offset),
-                 .align_mul = nir_intrinsic_align_mul(intrin),
-                 .align_offset = nir_intrinsic_align_offset(intrin));
-   nir_def_rewrite_uses(&intrin->def, val);
-   nir_instr_remove(&intrin->instr);
-
-   *size_B = MAX2(*size_B, offset + load_B);
-   return true;
-}
-
-/* *size_B_out: how many bytes of the root struct the shader now reads
- * through the constant buffer; 0 if it reads none that way.
- */
-bool
-kgp_nir_lower_root_v1(nir_shader *nir, uint32_t *size_B_out)
-{
-   *size_B_out = 0;
-   return nir_shader_intrinsics_pass(nir, lower_root_v1_intrin,
-                                     nir_metadata_control_flow, size_B_out);
 }
 
 /* Sets *bad_push_out if the shader reads push constants beyond the root

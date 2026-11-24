@@ -13,9 +13,7 @@
  * command buffer, each over elements / dispatches elements, so the total
  * work stays the same and the per-dispatch cost shows.
  *
- * Run each twice, without and with KGP_DEBUG=rootv1, to compare the two root
- * conventions (plan task N1.H). The arrays are GPU-only memory and are not
- * initialized: the work costs the same whatever the bits are. Nothing is
+ * The arrays are GPU-only memory and are not initialized: the work costs the same whatever the bits are. Nothing is
  * checked; correctness is the tests' job.
  */
 #include "kgp_test.h"
@@ -28,9 +26,7 @@
 
 #define RUNS 21
 
-/* Both padded to 64 bytes: root convention v1 wants that alignment and the
- * structs sit alone in their allocation.
- */
+/* Both padded to 64 bytes; the structs sit alone in their allocation. */
 struct saxpy_root {
    uint64_t x;
    uint64_t y;

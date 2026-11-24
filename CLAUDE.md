@@ -44,9 +44,8 @@ hardware-suite.sh`) so nvidia is always restored.
 
 `KGP_DEBUG=push,sync,vm,gart,asm,nir` on any KoreGP program: pushbuf dump,
 wait-after-every-submit, VA bind log, force system memory, NAK assembly, NIR.
-`rootv1` selects the experimental root convention. `KGP_DEBUG=1` (or
-`validate`, to combine it with the others) is the validation mode:
-`src/koregp/kgp_validate.c` says what it checks.
+`KGP_DEBUG=1` (or `validate`, to combine it with the others) is the
+validation mode: `src/koregp/kgp_validate.c` says what it checks.
 
 Measure only on the release flavor (`KGP_FLAVOR=release build-mesa.sh`).
 `KGP_FLAVOR=asan` builds with sanitizers; run its programs through

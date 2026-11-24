@@ -10,7 +10,7 @@ kgp_glslang = find_program('glslangValidator', native : true)
 kgp_spv = {}
 foreach name : ['saxpy', 'prefix_sum', 'scratch', 'genargs', 'rootloop',
                 'heap_copy', 'heap_fetch', 'heap_sample', 'heap_store',
-                'bad_push', 'bad_ubo', 'spec']
+                'bad_push', 'bad_ubo', 'spec', 'multi_gen']
   kgp_spv += {
     name : custom_target(
       name + '_spv.h',
@@ -24,9 +24,25 @@ foreach name : ['saxpy', 'prefix_sum', 'scratch', 'genargs', 'rootloop',
   }
 endforeach
 
+# The texel-fetch shader again for the other texture types.
+foreach name, define : {'heap_fetch_array' : 'FETCH_ARRAY',
+                        'heap_fetch_3d' : 'FETCH_3D'}
+  kgp_spv += {
+    name : custom_target(
+      name + '_spv.h',
+      input : 'shaders/heap_fetch.comp',
+      output : name + '_spv.h',
+      command : [
+        kgp_glslang, '--quiet', '--target-env', 'vulkan1.3', '-D' + define,
+        '--vn', name + '_spv', '-o', '@OUTPUT@', '@INPUT@',
+      ],
+    ),
+  }
+endforeach
+
 # Raster shaders: glslang takes the stage from the file extension.
 foreach name, file : {'tri_vs' : 'tri.vert', 'tri_ps' : 'tri.frag',
-                      'tex_ps' : 'tex.frag',
+                      'tri_mrt_ps' : 'tri_mrt.frag', 'tex_ps' : 'tex.frag',
                       'bad_ps_push' : 'bad_ps_push.frag'}
   kgp_spv += {
     name : custom_target(
@@ -54,15 +70,17 @@ kgp_tests = {
   'kgp_indirect' : [kgp_spv['saxpy'], kgp_spv['genargs']],
   'kgp_heap' : [kgp_spv['heap_copy'], kgp_spv['heap_fetch'],
                 kgp_spv['heap_sample'], kgp_spv['heap_store']],
-  'kgp_copy' : [kgp_spv['heap_fetch']],
+  'kgp_copy' : [kgp_spv['heap_fetch'], kgp_spv['heap_fetch_array'],
+                kgp_spv['heap_fetch_3d']],
   'kgp_gfx_pipeline' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'],
                         kgp_spv['bad_ps_push'], kgp_spv['saxpy']],
-  'kgp_triangle' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'], kgp_spv['saxpy']],
+  'kgp_triangle' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'], kgp_spv['saxpy'],
+                    kgp_spv['multi_gen'], kgp_spv['tri_mrt_ps']],
   'kgp_textured' : [kgp_spv['tri_vs'], kgp_spv['tex_ps']],
   'kgp_reject' : [kgp_spv['saxpy'], kgp_spv['bad_push'], kgp_spv['bad_ubo']],
   'kgp_spec' : [kgp_spv['spec'], kgp_spv['tri_vs'], kgp_spv['tri_ps']],
   'kgp_present' : [kgp_spv['tri_vs'], kgp_spv['tri_ps']],
-  'kgp_validate' : [kgp_spv['saxpy']],
+  'kgp_validate' : [kgp_spv['saxpy'], kgp_spv['heap_fetch']],
 }
 
 kgp_exes = {}
@@ -88,6 +106,15 @@ foreach name : ['kgp_heap', 'kgp_copy']
        suite : ['koregp-hardware'])
 endforeach
 
+# The copies again on one mip level, one array layer and a 3D texture.
+foreach variant : ['mip', 'layer', '3d']
+  test('kgp_copy_' + variant, kgp_exes['kgp_copy'], args : [variant],
+       suite : ['koregp-offline'], env : kgp_offline_env,
+       depends : libnouveau_noop_drm_shim)
+  test('kgp_copy_' + variant, kgp_exes['kgp_copy'], args : [variant],
+       suite : ['koregp-hardware'])
+endforeach
+
 # Presentation on the monitor: only in a window opened with modesetting on
 # (w0.sh present); hardware-suite.sh runs it when a display is connected.
 test('kgp_present_display', kgp_exes['kgp_present'], args : ['display'],
@@ -101,31 +128,16 @@ test('kgp_triangle_indirect', kgp_exes['kgp_triangle'], args : ['indirect'],
      suite : ['koregp-hardware'])
 
 # The triangle again with a depth target and state objects (R7), with a
-# depth-stencil target (R7b), and as a GPU-driven multi-draw (R9b).
-foreach variant : ['depth', 'stencil', 'multi']
+# depth-stencil target (R7b), as a GPU-driven multi-draw (R9b), and as that
+# with a compute shader writing everything the multi-draw reads.
+# Last, into render targets of other formats.
+foreach variant : ['depth', 'stencil', 'state', 'mrt', 'multi', 'multigpu',
+                   'srgb', 'rgba16f', 'rgba32f', 'r32f']
   test('kgp_triangle_' + variant, kgp_exes['kgp_triangle'], args : [variant],
        suite : ['koregp-offline'], env : kgp_offline_env,
        depends : libnouveau_noop_drm_shim)
   test('kgp_triangle_' + variant, kgp_exes['kgp_triangle'], args : [variant],
        suite : ['koregp-hardware'])
-endforeach
-
-# The same programs under root convention v1 (experimental, plan task N1.H):
-# the root struct bound as a constant buffer instead of chased as a pointer.
-kgp_offline_v1_env = environment()
-kgp_offline_v1_env.set('LD_PRELOAD', libnouveau_noop_drm_shim.full_path())
-kgp_offline_v1_env.set('NOUVEAU_CHIPSET', '164')
-kgp_offline_v1_env.set('KGP_TEST_OFFLINE', '1')
-kgp_offline_v1_env.set('KGP_DEBUG', 'rootv1')
-kgp_v1_env = environment()
-kgp_v1_env.set('KGP_DEBUG', 'rootv1')
-
-foreach name : ['kgp_saxpy', 'kgp_prefix_sum', 'kgp_scratch', 'kgp_indirect',
-                'kgp_heap', 'kgp_copy']
-  test(name + '_rootv1', kgp_exes[name], suite : ['koregp-offline'],
-       env : kgp_offline_v1_env, depends : libnouveau_noop_drm_shim)
-  test(name + '_rootv1', kgp_exes[name], suite : ['koregp-hardware'],
-       env : kgp_v1_env)
 endforeach
 
 # The multi-draw macro, simulated (no GPU, no shim).
@@ -160,7 +172,7 @@ if dep_vulkan_loader.found()
     'vk_baseline',
     ['vk_baseline.c', kgp_spv['saxpy'], kgp_spv['prefix_sum'],
      kgp_spv['scratch'], kgp_spv['genargs'], kgp_spv['tri_vs'],
-     kgp_spv['tri_ps']],
+     kgp_spv['tri_ps'], kgp_spv['tri_mrt_ps']],
     dependencies : dep_vulkan_loader,
     include_directories : inc_koregp,
     install : true,
@@ -189,7 +201,8 @@ if dep_vulkan_loader.found()
        suite : ['koregp-hardware'], env : kgp_vk_env,
        depends : [libvulkan_nouveau, _dev_icd])
 
-  foreach variant : [[], ['indirect'], ['depth'], ['stencil']]
+  foreach variant : [[], ['indirect'], ['depth'], ['stencil'], ['state'],
+                     ['mrt'], ['srgb'], ['rgba16f'], ['rgba32f'], ['r32f']]
     suffix = variant.length() > 0 ? '_' + variant[0] : ''
     test('triangle_matches_nvk' + suffix, find_program('sh'),
          args : [files('triangle_matches_nvk.sh'),
@@ -216,9 +229,9 @@ if dep_vulkan_loader.found()
 
   # GPU-side copies: the twin records on NVK's transfer-only queue, which
   # the shim has only with mesa-patches/0003.
-  foreach layout : ['tiled', 'linear']
-    layout_args = layout == 'linear' ? ['linear'] : []
-    suffix = layout == 'linear' ? '_linear' : ''
+  foreach layout : ['tiled', 'linear', 'mip', 'layer', '3d']
+    layout_args = layout == 'tiled' ? [] : [layout]
+    suffix = layout == 'tiled' ? '' : '_' + layout
     test('vk_copy' + suffix, vk_baseline, args : ['copy'] + layout_args,
          suite : ['koregp-offline'], env : kgp_vk_offline_env,
          depends : [libnouveau_noop_drm_shim, libvulkan_nouveau, _dev_icd])

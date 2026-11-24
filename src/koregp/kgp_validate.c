@@ -16,11 +16,14 @@
  *  - at kgpSubmit, that nothing a command buffer was recorded against has
  *    been freed since.
  *
+ * Heap indices are the shaders' to compute, so that check is compiled into
+ * the shaders of pipelines created under validation (kgp_nir_lower_heap.c):
+ * an index past the entries the command buffer gave the heap reads zero,
+ * and a write through it is dropped.
+ *
  * Not checked, because nothing here sees it: pointers stored in memory
- * (root structs, descriptors in a heap), anything the GPU computes
- * (indirect counts, heap indices in a shader), and handles (a destroyed
- * texture or pipeline). The proposal's NIR-injected bounds checks on heap
- * indexing are not written.
+ * (root structs, descriptors in a heap), anything else the GPU computes
+ * (indirect counts), and handles (a destroyed texture or pipeline).
  *
  * SPDX-License-Identifier: MIT
  */

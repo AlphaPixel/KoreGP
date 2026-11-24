@@ -213,8 +213,7 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 }
 
 static bool
-kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir,
-              uint32_t *user_root_size_B_out)
+kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir)
 {
    /* KoreGP has no descriptor sets. Buffers are reached through the root
     * pointer; textures by index into the heap (kgp_nir_lower_heap below).
@@ -265,7 +264,8 @@ kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir,
    }
 
    bool bad_heap = false;
-   NIR_PASS(_, nir, kgp_nir_lower_heap, &bad_heap);
+   NIR_PASS(_, nir, kgp_nir_lower_heap, dev->debug & KGP_DEBUG_VALIDATE,
+            &bad_heap);
    if (bad_heap) {
       kgp_err("textures and images must be in the texture heap (set 0, "
               "binding 0) and samplers in the sampler heap (set 0, binding 1)");
@@ -274,17 +274,6 @@ kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
-
-   /* Root convention v1 is a compute experiment (N1.H); raster roots are
-    * already register-like (delta D10).
-    */
-   *user_root_size_B_out = 0;
-   if (compute && (dev->debug & KGP_DEBUG_ROOT_V1)) {
-      /* Fold the address arithmetic so "root + constant" is recognizable. */
-      NIR_PASS(_, nir, nir_opt_constant_folding);
-      NIR_PASS(_, nir, nir_opt_algebraic);
-      NIR_PASS(_, nir, kgp_nir_lower_root_v1, user_root_size_B_out);
-   }
 
    if (compute) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
@@ -376,7 +365,6 @@ static void
 kgp_pipeline_fill_qmd_generic(const struct nv_device_info *info,
                               const struct KgpPipeline_T *pipeline,
                               uint32_t *qmd, uint64_t root_record_addr,
-                              uint64_t user_root_addr,
                               uint32_t x, uint32_t y, uint32_t z)
 {
    struct nak_qmd_info qmd_info = {
@@ -399,25 +387,8 @@ kgp_pipeline_fill_qmd_generic(const struct nv_device_info *info,
          .size = pipeline->data_size_B,
       };
    }
-   if (pipeline->user_root_size_B > 0) {
-      qmd_info.cbufs[qmd_info.num_cbufs++] = (struct nak_qmd_cbuf) {
-         .index = KGP_CBUF_USER_ROOT,
-         .addr = user_root_addr,
-         .size = pipeline->user_root_size_B,
-      };
-   }
 
    nak_fill_qmd(info, &pipeline->info, &qmd_info, qmd, pipeline->qmd_size_B);
-
-   /* Root v1 (delta D7): the caller may rewrite its root struct between
-    * dispatches, and the hardware caches constant buffers. Until measured
-    * otherwise, every such dispatch drops the constant cache.
-    */
-   if (pipeline->user_root_size_B > 0) {
-      nak_set_invalidate_cache(info, qmd, pipeline->qmd_size_B,
-                               false, false, false, false, false,
-                               true /* shader_constants */);
-   }
 }
 
 /* Returns false if the address field cannot be patched as whole dwords. */
@@ -453,8 +424,7 @@ kgp_pipeline_init_qmd(const struct nv_device_info *info,
 {
    pipeline->qmd_size_B = nak_qmd_size_B(info);
    assert(pipeline->qmd_size_B <= sizeof(pipeline->qmd));
-   kgp_pipeline_fill_qmd_generic(info, pipeline, pipeline->qmd,
-                                 0, 0, 0, 0, 0);
+   kgp_pipeline_fill_qmd_generic(info, pipeline, pipeline->qmd, 0, 0, 0, 0);
 
    const struct nak_qmd_dispatch_size_layout size =
       nak_get_qmd_dispatch_size_layout(info);
@@ -470,27 +440,21 @@ kgp_pipeline_init_qmd(const struct nv_device_info *info,
       size.z_start == size.y_start + 32;
    pipeline->qmd_patchable &=
       kgp_qmd_addr_patch_init(info, KGP_CBUF_ROOT, &pipeline->qmd_root_record);
-   pipeline->qmd_patchable &=
-      kgp_qmd_addr_patch_init(info, KGP_CBUF_USER_ROOT,
-                              &pipeline->qmd_user_root);
    pipeline->qmd_size_dw = size.x_start / 32;
    pipeline->max_groups_y = BITFIELD64_MASK(size.y_end - size.y_start);
    pipeline->max_groups_z = BITFIELD64_MASK(size.z_end - size.z_start);
 }
 
-/* Writes qmd_size_B bytes of QMD for one dispatch of this pipeline.
- * user_root_addr is only used under root convention v1.
- */
+/* Writes qmd_size_B bytes of QMD for one dispatch of this pipeline. */
 void
 kgp_pipeline_fill_qmd(const struct nv_device_info *info,
                       const struct KgpPipeline_T *pipeline,
                       uint32_t *qmd, uint64_t root_record_addr,
-                      uint64_t user_root_addr,
                       uint32_t x, uint32_t y, uint32_t z)
 {
    if (unlikely(!pipeline->qmd_patchable)) {
       kgp_pipeline_fill_qmd_generic(info, pipeline, qmd, root_record_addr,
-                                    user_root_addr, x, y, z);
+                                    x, y, z);
       return;
    }
 
@@ -501,14 +465,12 @@ kgp_pipeline_fill_qmd(const struct nv_device_info *info,
    qmd[pipeline->qmd_size_dw + 2] = z;
 
    kgp_qmd_addr_patch_apply(&pipeline->qmd_root_record, qmd, root_record_addr);
-   if (pipeline->user_root_size_B > 0)
-      kgp_qmd_addr_patch_apply(&pipeline->qmd_user_root, qmd, user_root_addr);
 
 #ifndef NDEBUG
    /* Assert-enabled builds check every patched QMD against NAK's own. */
    uint32_t check[NAK_MAX_QMD_DWORDS];
    kgp_pipeline_fill_qmd_generic(info, pipeline, check, root_record_addr,
-                                 user_root_addr, x, y, z);
+                                 x, y, z);
    assert(memcmp(qmd, check, pipeline->qmd_size_B) == 0);
 #endif
 }
@@ -535,9 +497,8 @@ kgpCreateComputePipeline(KgpDevice dev, KgpByteSpan spirv,
    struct KgpPipeline_T *pipeline = NULL;
    struct nak_shader_bin *bin = NULL;
 
-   uint32_t user_root_size_B;
    nak_preprocess_nir(nir, dev->nak);
-   if (!kgp_lower_nir(dev, nir, &user_root_size_B))
+   if (!kgp_lower_nir(dev, nir))
       goto fail;
 
    if (dev->debug & KGP_DEBUG_NIR)
@@ -553,16 +514,14 @@ kgpCreateComputePipeline(KgpDevice dev, KgpByteSpan spirv,
    if (dump_asm && bin->asm_str != NULL) {
       fputs(bin->asm_str, stderr);
       fprintf(stderr, "koregp: %u instructions, %u GPRs, %u bytes of local "
-              "memory per lane, %u root bytes as cbuf\n",
-              bin->info.num_instrs, bin->info.num_gprs, bin->info.slm_size,
-              user_root_size_B);
+              "memory per lane\n",
+              bin->info.num_instrs, bin->info.num_gprs, bin->info.slm_size);
    }
 
    pipeline = calloc(1, sizeof(*pipeline));
    if (pipeline == NULL)
       goto fail;
    pipeline->info = bin->info;
-   pipeline->user_root_size_B = align(user_root_size_B, KGP_CBUF_ALIGN_B);
 
    /* Layout: code | pad to cbuf alignment | constant data | overalloc.
     * Compute shaders have no header, and the allocation is page-aligned,
@@ -676,8 +635,7 @@ kgp_gfx_stage_nir(struct KgpDevice_T *dev, KgpByteSpan spirv,
 
    nak_preprocess_nir(nir, dev->nak);
 
-   uint32_t unused;
-   if (!kgp_lower_nir(dev, nir, &unused)) {
+   if (!kgp_lower_nir(dev, nir)) {
       ralloc_free(nir);
       return NULL;
    }
@@ -717,6 +675,13 @@ kgpCreateGraphicsPipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
               "colour targets and a known depth format, topology and cull "
               "mode", KGP_MAX_COLOR_TARGETS);
       return NULL;
+   }
+   for (uint32_t i = 0; i < raster->colorTargetCount; i++) {
+      if (raster->colorWrite[i] > KGP_COLOR_WRITE_NONE) {
+         kgp_err("kgpCreateGraphicsPipeline: colorWrite[%u] is not a "
+                 "KGP_COLOR_WRITE value", i);
+         return NULL;
+      }
    }
    struct nir_spirv_specialization *spec;
    if (!kgp_spec_to_nir(constants, &spec)) {

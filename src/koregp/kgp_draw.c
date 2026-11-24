@@ -1188,6 +1188,30 @@ kgp_push_ds_state(struct nv_push *p, const struct KgpDepthStencilState_T *state)
    }
 }
 
+/* Ancestor: the two depth-bias groups of nvk_flush_rs_state. The unit of
+ * the constant is the depth format's resolution, Vulkan's default
+ * representation.
+ */
+static void
+kgp_push_depth_bias(struct nv_push *p,
+                    const struct KgpDepthStencilState_T *state)
+{
+   const bool enable = state != NULL && state->bias_enable;
+
+   P_MTHD(p, NV9097, SET_POLY_OFFSET_POINT);
+   P_NV9097_SET_POLY_OFFSET_POINT(p, enable);
+   P_NV9097_SET_POLY_OFFSET_LINE(p, enable);
+   P_NV9097_SET_POLY_OFFSET_FILL(p, enable);
+
+   P_IMMD(p, NV9097, SET_DEPTH_BIAS_CONTROL, DEPTH_FORMAT_DEPENDENT_TRUE);
+   P_IMMD(p, NV9097, SET_DEPTH_BIAS, fui(enable ? state->bias : 0.0f));
+   P_IMMD(p, NV9097, SET_SLOPE_SCALE_DEPTH_BIAS,
+          fui(enable ? state->bias_slope : 0.0f));
+   P_IMMD(p, NV9097, SET_DEPTH_BIAS_CLAMP,
+          fui(enable ? state->bias_clamp : 0.0f));
+}
+#define KGP_DEPTH_BIAS_PUSH_DW 12
+
 /* The proposal's state snippet: the methods are built here, once, and a
  * draw copies them.
  */
@@ -1196,7 +1220,9 @@ kgpCreateDepthStencilState(KgpDevice dev, const KgpDepthStencilDesc *desc)
 {
    if (desc == NULL || (unsigned)desc->depthCompare > KGP_COMPARE_ALWAYS ||
        !kgp_stencil_face_valid(&desc->stencilFront) ||
-       !kgp_stencil_face_valid(&desc->stencilBack)) {
+       !kgp_stencil_face_valid(&desc->stencilBack) ||
+       !isfinite(desc->depthBias) || !isfinite(desc->depthBiasSlope) ||
+       !isfinite(desc->depthBiasClamp)) {
       kgp_err("kgpCreateDepthStencilState: bad desc");
       return NULL;
    }
@@ -1212,6 +1238,10 @@ kgpCreateDepthStencilState(KgpDevice dev, const KgpDepthStencilDesc *desc)
    state->push_dw = nv_push_dw_count(&push);
    state->needs_depth_target = desc->depthTest || desc->depthWrite;
    state->needs_stencil = desc->stencilTest;
+   state->bias_enable = desc->depthBias != 0.0f || desc->depthBiasSlope != 0.0f;
+   state->bias = desc->depthBias;
+   state->bias_slope = desc->depthBiasSlope;
+   state->bias_clamp = desc->depthBiasClamp;
    return state;
 }
 
@@ -1237,6 +1267,10 @@ kgp_blend_factor(KGP_BLEND_FACTOR factor)
       FACTOR(INV_SRC_ALPHA, ONE_MINUS_SRC_ALPHA),
       FACTOR(DST_ALPHA,     DST_ALPHA),
       FACTOR(INV_DST_ALPHA, ONE_MINUS_DST_ALPHA),
+      FACTOR(CONSTANT_COLOR,     CONSTANT_COLOR),
+      FACTOR(INV_CONSTANT_COLOR, ONE_MINUS_CONSTANT_COLOR),
+      FACTOR(CONSTANT_ALPHA,     CONSTANT_ALPHA),
+      FACTOR(INV_CONSTANT_ALPHA, ONE_MINUS_CONSTANT_ALPHA),
    };
 #undef FACTOR
    return factors[factor];
@@ -1274,7 +1308,7 @@ kgp_push_blend_state(struct nv_push *p, const struct KgpBlendState_T *state,
    const KgpBlendDesc *desc = state ? &state->desc : &off;
 
    for (uint8_t a = 0; a < color_count; a++)
-      P_IMMD(p, NV9097, SET_BLEND(a), state != NULL);
+      P_IMMD(p, NV9097, SET_BLEND(a), state != NULL && state->enable);
 
    for (uint8_t a = 0; a < color_count; a++) {
       P_MTHD(p, NV9097, SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA(a));
@@ -1294,23 +1328,69 @@ kgp_push_blend_state(struct nv_push *p, const struct KgpBlendState_T *state,
    }
 }
 
+/* Ancestor: the write-mask group of nvk_flush_cb_state. The macro takes
+ * four bits per target, in Vulkan's order, which is KGP_COLOR_WRITE's. A
+ * target's mask is the blend state's, narrowed by the pipeline's for it.
+ */
+static void
+kgp_push_write_mask(struct nv_push *p, const struct KgpBlendState_T *state,
+                    const KgpRasterDesc *raster, uint32_t color_count)
+{
+   const uint32_t all = state ? state->write_mask : 0xf;
+   uint32_t write_mask = 0;
+   for (uint8_t a = 0; a < color_count; a++) {
+      write_mask |= (all & kgp_color_write_bits(raster->colorWrite[a]))
+                    << (4 * a);
+   }
+   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_WRITE_MASK));
+   P_INLINE_DATA(p, color_count);
+   P_INLINE_DATA(p, write_mask);
+}
+
+static void
+kgp_push_blend_constant(struct nv_push *p,
+                        const struct KgpBlendState_T *state)
+{
+   static const float zero[4] = { 0 };
+   const float *c = state ? state->desc.constant : zero;
+
+   P_MTHD(p, NV9097, SET_BLEND_CONST_RED);
+   P_NV9097_SET_BLEND_CONST_RED(p,     fui(c[0]));
+   P_NV9097_SET_BLEND_CONST_GREEN(p,   fui(c[1]));
+   P_NV9097_SET_BLEND_CONST_BLUE(p,    fui(c[2]));
+   P_NV9097_SET_BLEND_CONST_ALPHA(p,   fui(c[3]));
+}
+#define KGP_BLEND_TAIL_PUSH_DW 8    /* the write mask and the constant */
+
 KGP_API KgpBlendState
 kgpCreateBlendState(KgpDevice dev, const KgpBlendDesc *desc)
 {
    if (desc == NULL ||
-       (unsigned)desc->srcColor > KGP_BLEND_INV_DST_ALPHA ||
-       (unsigned)desc->dstColor > KGP_BLEND_INV_DST_ALPHA ||
-       (unsigned)desc->srcAlpha > KGP_BLEND_INV_DST_ALPHA ||
-       (unsigned)desc->dstAlpha > KGP_BLEND_INV_DST_ALPHA ||
+       (unsigned)desc->srcColor > KGP_BLEND_INV_CONSTANT_ALPHA ||
+       (unsigned)desc->dstColor > KGP_BLEND_INV_CONSTANT_ALPHA ||
+       (unsigned)desc->srcAlpha > KGP_BLEND_INV_CONSTANT_ALPHA ||
+       (unsigned)desc->dstAlpha > KGP_BLEND_INV_CONSTANT_ALPHA ||
        (unsigned)desc->colorOp > KGP_BLEND_OP_MAX ||
-       (unsigned)desc->alphaOp > KGP_BLEND_OP_MAX) {
+       (unsigned)desc->alphaOp > KGP_BLEND_OP_MAX ||
+       desc->colorWrite > KGP_COLOR_WRITE_NONE ||
+       !isfinite(desc->constant[0]) || !isfinite(desc->constant[1]) ||
+       !isfinite(desc->constant[2]) || !isfinite(desc->constant[3])) {
       kgp_err("kgpCreateBlendState: bad desc");
       return NULL;
    }
 
    struct KgpBlendState_T *state = calloc(1, sizeof(*state));
-   if (state != NULL)
-      state->desc = *desc;
+   if (state == NULL)
+      return NULL;
+
+   state->desc = *desc;
+   state->enable = !(desc->srcColor == KGP_BLEND_ONE &&
+                     desc->dstColor == KGP_BLEND_ZERO &&
+                     desc->colorOp == KGP_BLEND_OP_ADD &&
+                     desc->srcAlpha == KGP_BLEND_ONE &&
+                     desc->dstAlpha == KGP_BLEND_ZERO &&
+                     desc->alphaOp == KGP_BLEND_OP_ADD);
+   state->write_mask = kgp_color_write_bits(desc->colorWrite);
    return state;
 }
 
@@ -1432,7 +1512,9 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
       });
    }
 
-   /* rs: filled triangles, depth clipped to 0..1, no bias, default lines. */
+   /* rs: filled triangles, depth clipped to 0..1, the depth-stencil
+    * state's bias, default lines.
+    */
    P_IMMD(p, NV9097, SET_RASTER_ENABLE, true);
 
    /* As nvk_flush_rs_state without depth clamp: the extra clamp of depth
@@ -1472,15 +1554,7 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
    P_IMMD(p, NV9097, SET_PROVOKING_VERTEX,
           NV9097_SET_PROVOKING_VERTEX_V_FIRST);
 
-   P_MTHD(p, NV9097, SET_POLY_OFFSET_POINT);
-   P_NV9097_SET_POLY_OFFSET_POINT(p, false);
-   P_NV9097_SET_POLY_OFFSET_LINE(p, false);
-   P_NV9097_SET_POLY_OFFSET_FILL(p, false);
-
-   P_IMMD(p, NV9097, SET_DEPTH_BIAS_CONTROL, DEPTH_FORMAT_DEPENDENT_TRUE);
-   P_IMMD(p, NV9097, SET_DEPTH_BIAS, fui(0.0f));
-   P_IMMD(p, NV9097, SET_SLOPE_SCALE_DEPTH_BIAS, fui(0.0f));
-   P_IMMD(p, NV9097, SET_DEPTH_BIAS_CLAMP, fui(0.0f));
+   kgp_push_depth_bias(p, cb->ds_state);
 
    P_MTHD(p, NV9097, SET_LINE_WIDTH_FLOAT);
    P_NV9097_SET_LINE_WIDTH_FLOAT(p, fui(1.0f));
@@ -1540,20 +1614,15 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
    /* ds: the state object's words, or all off. */
    kgp_push_ds_state(p, cb->ds_state);
 
-   /* cb: no logic op, the blend state, every channel of every target
-    * written.
+   /* cb: no logic op, and the blend state's equation, write mask and
+    * constant.
     */
    P_IMMD(p, NV9097, SET_LOGIC_OP, false);
    P_IMMD(p, NV9097, SET_LOGIC_OP_FUNC, NV9097_SET_LOGIC_OP_FUNC_V_CLEAR);
 
    kgp_push_blend_state(p, cb->blend_state, color_count);
 
-   uint32_t write_mask = 0;
-   for (uint8_t a = 0; a < color_count; a++)
-      write_mask |= 0xf << (4 * a);
-   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_WRITE_MASK));
-   P_INLINE_DATA(p, color_count);
-   P_INLINE_DATA(p, write_mask);
+   kgp_push_write_mask(p, cb->blend_state, raster, color_count);
 
    P_IMMD(p, NV9097, SET_CT_SELECT, {
       .target_count = color_count,
@@ -1567,11 +1636,7 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
       .target7 = 7,
    });
 
-   P_MTHD(p, NV9097, SET_BLEND_CONST_RED);
-   P_NV9097_SET_BLEND_CONST_RED(p,     fui(0.0f));
-   P_NV9097_SET_BLEND_CONST_GREEN(p,   fui(0.0f));
-   P_NV9097_SET_BLEND_CONST_BLUE(p,    fui(0.0f));
-   P_NV9097_SET_BLEND_CONST_ALPHA(p,   fui(0.0f));
+   kgp_push_blend_constant(p, cb->blend_state);
 
    /* The shaders, and their constant data. */
    p = kgp_cb_push(cb, pipeline->gfx_push_dw);
@@ -1643,28 +1708,39 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
                       indices_known ? index_bytes : 4, 4))
       return false;
 
-   const uint64_t roots[2] = { (uintptr_t)vsData, (uintptr_t)psData };
-
-   struct nv_push *p = kgp_cb_push(cb, 11);
-
    /* The two root pointers, inline, into the hardware root table that the
-    * shaders read as c[31][0] and c[31][8].
+    * shaders read as c[31][0] and c[31][8]. Under validation the heap
+    * counts go behind them, for the shaders' bounds checks.
     */
+   const uint64_t roots[2] = { (uintptr_t)vsData, (uintptr_t)psData };
+   static_assert(KGP_GFX_ROOT_HEAP_COUNTS_OFFSET_B == sizeof(roots),
+                 "the heap counts follow the root pointers");
+
+   struct nv_push *p = kgp_cb_push(cb, 13);
+
    P_1INC(p, NVC597, SET_ROOT_TABLE_SELECTOR);
    P_NVC597_SET_ROOT_TABLE_SELECTOR(p, {
       .root_table = KGP_GFX_ROOT_TABLE,
       .offset = 0,
    });
    P_INLINE_ARRAY(p, (const uint32_t *)roots, 4);
+   if (unlikely(cb->validate))
+      P_INLINE_ARRAY(p, cb->heap_counts, 2);
 
-   /* ponytail: rebinds the index buffer on every draw (5 words). Remember
-    * the last one in the command buffer if draw counts make it matter.
+   /* The index buffer, unless this command buffer's last bind covers it:
+    * draws from one buffer bind it once, as vkCmdBindIndexBuffer would.
+    * The size is only the hardware's read limit, so a larger one from an
+    * earlier draw stands.
     */
-   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_IB));
-   P_INLINE_DATA(p, index_addr >> 32);
-   P_INLINE_DATA(p, index_addr);
-   P_INLINE_DATA(p, index_bytes);
-   P_INLINE_DATA(p, 1 /* VK_INDEX_TYPE_UINT32, which the macro decodes */);
+   if (cb->ib_addr != index_addr || index_bytes > cb->ib_bytes) {
+      P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_IB));
+      P_INLINE_DATA(p, index_addr >> 32);
+      P_INLINE_DATA(p, index_addr);
+      P_INLINE_DATA(p, index_bytes);
+      P_INLINE_DATA(p, 1 /* VK_INDEX_TYPE_UINT32, which the macro decodes */);
+      cb->ib_addr = index_addr;
+      cb->ib_bytes = index_bytes;
+   }
 
    if (cb->gfx_dirty) {
       kgp_cb_flush_gfx_state(cb);
@@ -1672,11 +1748,18 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
       /* A state object changed between draws of one pipeline: only its
        * methods, as NVK sends only the dynamic state that changed.
        */
-      p = kgp_cb_push(cb, KGP_DS_PUSH_DW + 9 * cb->rp_color_count);
-      if (cb->ds_dirty)
+      p = kgp_cb_push(cb, KGP_DEPTH_BIAS_PUSH_DW + KGP_DS_PUSH_DW +
+                          9 * cb->rp_color_count + KGP_BLEND_TAIL_PUSH_DW);
+      if (cb->ds_dirty) {
+         kgp_push_depth_bias(p, cb->ds_state);
          kgp_push_ds_state(p, cb->ds_state);
-      if (cb->blend_dirty)
+      }
+      if (cb->blend_dirty) {
          kgp_push_blend_state(p, cb->blend_state, cb->rp_color_count);
+         kgp_push_write_mask(p, cb->blend_state, &pipeline->raster,
+                             cb->rp_color_count);
+         kgp_push_blend_constant(p, cb->blend_state);
+      }
       cb->ds_dirty = false;
       cb->blend_dirty = false;
    }

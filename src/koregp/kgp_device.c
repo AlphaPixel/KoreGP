@@ -28,7 +28,6 @@ static const struct debug_control kgp_nvkmd_debug_options[] = {
 static const struct debug_control kgp_debug_options[] = {
    { "asm", KGP_DEBUG_ASM },
    { "nir", KGP_DEBUG_NIR },
-   { "rootv1", KGP_DEBUG_ROOT_V1 },
    { "1", KGP_DEBUG_VALIDATE },       /* the proposal's spelling */
    { "validate", KGP_DEBUG_VALIDATE },
    { NULL, 0 },
