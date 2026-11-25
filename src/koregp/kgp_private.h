@@ -129,7 +129,7 @@ struct KgpPipeline_T {
     * once (ancestor: nvk_shader::push_dw).
     */
    bool graphics;
-   bool mesh;                  /* graphics, with a mesh shader first */
+   bool mesh;                  /* graphics, with mesh (and task) shaders */
    struct nak_shader_info ps_info;
    KgpRasterDesc raster;
    uint32_t *gfx_push;
@@ -365,7 +365,8 @@ bool kgp_nir_lower_heap(struct nir_shader *nir, bool bounds_check,
 
 /* kgp_nir_lower_root.c */
 struct nir_shader;
-bool kgp_nir_lower_root(struct nir_shader *nir, bool *bad_push_out);
+bool kgp_nir_lower_root(struct nir_shader *nir, bool has_task,
+                        bool *bad_push_out);
 
 /* kgp_draw.c */
 #define KGP_DRAW_CB0_MEM_SIZE_B 4096
@@ -378,8 +379,8 @@ bool kgp_push_draw_state_init(const struct nv_device_info *info,
                               uint64_t zero_addr, uint32_t *mme_end_out);
 bool kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
                                  struct KgpPipeline_T *pipeline,
-                                 const struct kgp_gfx_shader *vs,
-                                 const struct kgp_gfx_shader *ps);
+                                 const struct kgp_gfx_shader *shaders,
+                                 unsigned count);
 
 /* kgp_cmd.c */
 bool kgp_queue_init(struct KgpDevice_T *dev);

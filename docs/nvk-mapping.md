@@ -398,9 +398,14 @@ shader is bound in the vertex shader's slot and binding group, so root
 table 7 serves it as it serves a vertex shader; its group counts are in
 root table 0, where NVK's mesh draw macros put them and where
 `gl_NumWorkGroups` is read. Per-primitive outputs need a second program
-header for the geometry stage, which NAK generates. No task shader:
-`kgpDrawMeshlets` takes the group counts a task shader would have
-computed.
+header for the geometry stage, which NAK generates. Without a task
+shader `kgpDrawMeshlets` takes the group counts one would have computed.
+With one (written 2026-11-25, correct on the GPU in the fourteenth window) the task shader takes
+the vertex slot and binding group and the mesh shader the tessellation
+evaluation ones, as in NVK; the hardware's root tables are visible to
+every binding group, so both read the one mesh-stage root pointer and the
+API needs no third. The mesh shader's `gl_NumWorkGroups` then comes from
+the task shader through the payload's reserved words, which NAK reads.
 
 MSAA (written 2026-11-24, correct on the GPU in the thirteenth window): the sample count is a
 property of the texture's layout (NIL) and of the render pass; sample

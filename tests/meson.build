@@ -40,10 +40,26 @@ foreach name, define : {'heap_fetch_array' : 'FETCH_ARRAY',
   }
 endforeach
 
+# tri.mesh again, as the mesh shader behind tri.task.
+kgp_spv += {
+  'tri_task_ms' : custom_target(
+    'tri_task_ms_spv.h',
+    input : 'shaders/tri.mesh',
+    output : 'tri_task_ms_spv.h',
+    command : [
+      kgp_glslang, '--quiet', '--target-env', 'vulkan1.3', '-DTASK',
+      '--vn', 'tri_task_ms_spv', '-o', '@OUTPUT@', '@INPUT@',
+    ],
+  ),
+}
+
 # Raster shaders: glslang takes the stage from the file extension.
 foreach name, file : {'tri_vs' : 'tri.vert', 'tri_ps' : 'tri.frag',
                       'tri_mrt_ps' : 'tri_mrt.frag', 'tex_ps' : 'tex.frag',
                       'tri_ms' : 'tri.mesh', 'tri_mesh_ps' : 'tri_mesh.frag',
+                      'tri_ts' : 'tri.task',
+                      'noapi_vs' : 'noapi.vert', 'noapi_ps' : 'noapi.frag',
+                      'noapi_cs' : 'noapi.comp',
                       'bad_ps_push' : 'bad_ps_push.frag'}
   kgp_spv += {
     name : custom_target(
@@ -79,11 +95,14 @@ kgp_tests = {
   'kgp_triangle' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'], kgp_spv['saxpy'],
                     kgp_spv['multi_gen'], kgp_spv['tri_mrt_ps'],
                     kgp_spv['tri_ms'], kgp_spv['tri_mesh_ps'],
+                    kgp_spv['tri_ts'], kgp_spv['tri_task_ms'],
                     kgp_spv['tri_resolve']],
   'kgp_textured' : [kgp_spv['tri_vs'], kgp_spv['tex_ps']],
   'kgp_reject' : [kgp_spv['saxpy'], kgp_spv['bad_push'], kgp_spv['bad_ubo']],
   'kgp_spec' : [kgp_spv['spec'], kgp_spv['tri_vs'], kgp_spv['tri_ps']],
   'kgp_present' : [kgp_spv['tri_vs'], kgp_spv['tri_ps']],
+  'kgp_noapi' : [kgp_spv['noapi_vs'], kgp_spv['noapi_ps'],
+                 kgp_spv['noapi_cs']],
   'kgp_validate' : [kgp_spv['saxpy'], kgp_spv['heap_fetch']],
 }
 
@@ -124,6 +143,22 @@ endforeach
 test('kgp_present_display', kgp_exes['kgp_present'], args : ['display'],
      suite : ['koregp-hardware'], is_parallel : false)
 
+# The no_api examples (the proposal's M2 exit test); without an argument
+# the program runs the first, hello_triangle. On the monitor like
+# kgp_present_display.
+foreach example : ['compute', 'playground']
+  test('kgp_noapi_' + example, kgp_exes['kgp_noapi'], args : [example],
+       suite : ['koregp-offline'], env : kgp_offline_env,
+       depends : libnouveau_noop_drm_shim)
+  test('kgp_noapi_' + example, kgp_exes['kgp_noapi'], args : [example],
+       suite : ['koregp-hardware'])
+endforeach
+foreach example : ['triangle', 'compute', 'playground']
+  test('kgp_noapi_' + example + '_display', kgp_exes['kgp_noapi'],
+       args : [example, 'display'], suite : ['koregp-hardware'],
+       is_parallel : false)
+endforeach
+
 # The triangle again with its draw arguments read by the GPU.
 test('kgp_triangle_indirect', kgp_exes['kgp_triangle'], args : ['indirect'],
      suite : ['koregp-offline'], env : kgp_offline_env,
@@ -131,13 +166,19 @@ test('kgp_triangle_indirect', kgp_exes['kgp_triangle'], args : ['indirect'],
 test('kgp_triangle_indirect', kgp_exes['kgp_triangle'], args : ['indirect'],
      suite : ['koregp-hardware'])
 
+# Offline this only records; on hardware the suite runs the program itself
+# (hardware-suite.sh, "split_never").
+test('kgp_split_never', kgp_exes['kgp_split'], args : ['never'],
+     suite : ['koregp-offline'], env : kgp_offline_env,
+     depends : libnouveau_noop_drm_shim)
+
 # The triangle again with a depth target and state objects (R7), with a
 # depth-stencil target (R7b), as a GPU-driven multi-draw (R9b), and as that
 # with a compute shader writing everything the multi-draw reads.
 # Last, into render targets of other formats.
 foreach variant : ['depth', 'stencil', 'state', 'mrt', 'multi', 'multigpu',
                    'srgb', 'rgba16f', 'rgba32f', 'r32f', 'mesh',
-                   'meshindirect', 'msaa']
+                   'meshindirect', 'task', 'msaa']
   test('kgp_triangle_' + variant, kgp_exes['kgp_triangle'], args : [variant],
        suite : ['koregp-offline'], env : kgp_offline_env,
        depends : libnouveau_noop_drm_shim)
@@ -178,7 +219,7 @@ if dep_vulkan_loader.found()
     ['vk_baseline.c', kgp_spv['saxpy'], kgp_spv['prefix_sum'],
      kgp_spv['scratch'], kgp_spv['genargs'], kgp_spv['tri_vs'],
      kgp_spv['tri_ps'], kgp_spv['tri_mrt_ps'], kgp_spv['tri_ms'],
-     kgp_spv['tri_mesh_ps']],
+     kgp_spv['tri_mesh_ps'], kgp_spv['tri_ts'], kgp_spv['tri_task_ms']],
     dependencies : dep_vulkan_loader,
     include_directories : inc_koregp,
     install : true,
@@ -209,7 +250,7 @@ if dep_vulkan_loader.found()
 
   foreach variant : [[], ['indirect'], ['depth'], ['stencil'], ['state'],
                      ['mrt'], ['srgb'], ['rgba16f'], ['rgba32f'], ['r32f'],
-                     ['mesh'], ['meshindirect'], ['msaa']]
+                     ['mesh'], ['meshindirect'], ['task'], ['msaa']]
     suffix = variant.length() > 0 ? '_' + variant[0] : ''
     test('triangle_matches_nvk' + suffix, find_program('sh'),
          args : [files('triangle_matches_nvk.sh'),

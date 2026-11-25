@@ -1,0 +1,37 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// The "task" variant's task shader (tri_scene.h): one workgroup per quad.
+// Each reads the mesh stage's root pointer, puts its quad's offset in the
+// payload and launches one workgroup of tri.mesh (built with -DTASK),
+// which takes the offset from there.
+
+struct Vertex {
+   vec2 pos;
+   vec4 color;
+};
+
+layout(buffer_reference, scalar) readonly buffer VertexArray { Vertex v[]; };
+
+layout(buffer_reference, scalar) readonly buffer TriVsRoot {
+   VertexArray vertices;
+   float instanceStep;
+   float z;
+};
+
+layout(push_constant, scalar) uniform Push { TriVsRoot root; };
+
+layout(local_size_x = 1) in;
+
+struct TriPayload {
+   float offset;
+};
+taskPayloadSharedEXT TriPayload payload;
+
+void main()
+{
+   payload.offset = root.instanceStep * float(gl_WorkGroupID.x);
+   EmitMeshTasksEXT(1, 1, 1);
+}

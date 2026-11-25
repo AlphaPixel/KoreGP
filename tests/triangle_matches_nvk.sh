@@ -19,6 +19,7 @@ ind=0
 [ "${4:-}" = indirect ] && ind=1
 mesh=0
 [ "${4:-}" = mesh ] && mesh=1
+[ "${4:-}" = task ] && mesh=1    # the same draw macro
 [ "${4:-}" = meshindirect ] && mesh=2
 
 NVK_DEBUG=push_dump "$3" triangle ${4:+"$4"} 2>&1 >/dev/null |

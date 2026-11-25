@@ -523,22 +523,33 @@ kgp_push_draw_state_init(const struct nv_device_info *info, struct nv_push *p,
 
 /* Ancestor: mesa_to_nv9097_shader_type. */
 static uint32_t
-kgp_shader_type(mesa_shader_stage stage)
+kgp_shader_type(const struct nak_shader_info *sh)
 {
-   /* A mesh shader without a task shader takes the vertex shader's place
-    * (ancestor: mesa_to_nv9097_shader_type).
+   /* A task shader, or a mesh shader without one, takes the vertex
+    * shader's place; a mesh shader behind a task shader takes the
+    * tessellation evaluation shader's.
     */
-   assert(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_MESH ||
-          stage == MESA_SHADER_FRAGMENT);
-   return stage == MESA_SHADER_FRAGMENT ? NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL
-                                        : NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX;
+   switch (sh->stage) {
+   case MESA_SHADER_FRAGMENT:
+      return NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL;
+   case MESA_SHADER_MESH:
+      return sh->mesh.has_task_shader
+             ? NV9097_SET_PIPELINE_SHADER_TYPE_TESSELLATION
+             : NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX;
+   default:
+      assert(sh->stage == MESA_SHADER_VERTEX || sh->stage == MESA_SHADER_TASK);
+      return NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX;
+   }
 }
 
 /* Ancestors: nvk_pipeline_bind_group, nvk_cbuf_binding_for_stage. */
 static uint32_t
-kgp_bind_group(mesa_shader_stage stage)
+kgp_bind_group(const struct nak_shader_info *sh)
 {
-   return stage == MESA_SHADER_MESH ? MESA_SHADER_VERTEX : stage;
+   if (sh->stage == MESA_SHADER_MESH)
+      return sh->mesh.has_task_shader ? MESA_SHADER_TESS_EVAL
+                                      : MESA_SHADER_VERTEX;
+   return sh->stage == MESA_SHADER_TASK ? MESA_SHADER_VERTEX : sh->stage;
 }
 
 /* Ancestor: nvk_shader_fill_push up to "Stash this", vertex and pixel
@@ -549,7 +560,7 @@ kgp_shader_fill_push(const struct nv_device_info *info, struct nv_push *p,
                      const struct kgp_gfx_shader *shader)
 {
    const struct nak_shader_info *sh = shader->info;
-   const uint32_t type = kgp_shader_type(sh->stage);
+   const uint32_t type = kgp_shader_type(sh);
 
    /* We always map index == type */
    const uint32_t idx = type;
@@ -574,13 +585,27 @@ kgp_shader_fill_push(const struct nv_device_info *info, struct nv_push *p,
    /* The binding group is the stage, as for constant buffers. */
    P_MTHD(p, NVC397, SET_PIPELINE_REGISTER_COUNT(idx));
    P_NVC397_SET_PIPELINE_REGISTER_COUNT(p, idx, sh->num_gprs);
-   P_NVC397_SET_PIPELINE_BINDING(p, idx, kgp_bind_group(sh->stage));
+   P_NVC397_SET_PIPELINE_BINDING(p, idx, kgp_bind_group(sh));
 
-   if (sh->stage != MESA_SHADER_FRAGMENT) {
-      P_IMMD(p, NVC597, SET_MESH_CONTROL, sh->stage == MESA_SHADER_MESH);
+   /* Set by the first stage: on when that is not a vertex shader. */
+   if (type == NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX) {
+      P_IMMD(p, NVC597, SET_MESH_CONTROL, sh->stage != MESA_SHADER_VERTEX);
    }
 
-   if (sh->stage == MESA_SHADER_MESH) {
+   if (sh->stage == MESA_SHADER_TASK) {
+      const uint16_t smem_lines = DIV_ROUND_UP(sh->task.smem_size, 128);
+      const uint16_t task_smem_lines =
+         DIV_ROUND_UP(sh->task.payload_smem_size, 128);
+
+      /* Task payload should be part of shared memory */
+      assert(task_smem_lines <= smem_lines);
+
+      P_IMMD(p, NVC597, SET_MESH_INIT_SHADER, {
+         .thread_count = sh->task.local_size,
+         .local_buffer_lines = smem_lines,
+         .output_to_m_s_lines = task_smem_lines,
+      });
+   } else if (sh->stage == MESA_SHADER_MESH) {
       assert(sh->mesh.max_vertices != 0 && sh->mesh.max_primitives != 0);
 
       /* The shadow-RAM mode around the two methods is a workaround NVK
@@ -721,9 +746,15 @@ kgp_shader_fill_push_vtgm(const struct nv_device_info *info,
 bool
 kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
                             struct KgpPipeline_T *pipeline,
-                            const struct kgp_gfx_shader *vs,
-                            const struct kgp_gfx_shader *ps)
+                            const struct kgp_gfx_shader *shaders,
+                            unsigned count)
 {
+   /* The last stage before the rasterizer: vertex or mesh. */
+   const struct kgp_gfx_shader *vs = &shaders[count - 2];
+   const struct kgp_gfx_shader *by_type[6] = { NULL };
+   for (unsigned i = 0; i < count; i++)
+      by_type[kgp_shader_type(shaders[i].info)] = &shaders[i];
+
    uint32_t push_dw[512];
    struct nv_push push, *p = &push;
    nv_push_init(&push, push_dw, ARRAY_SIZE(push_dw),
@@ -739,10 +770,8 @@ kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
    for (unsigned i = 0; i < ARRAY_SIZE(types); i++) {
       assert(i == 0 || types[i] > types[i - 1]);
       const uint32_t type = types[i];
-      if (type == kgp_shader_type(MESA_SHADER_VERTEX)) {
-         kgp_shader_fill_push(info, p, vs);
-      } else if (type == kgp_shader_type(MESA_SHADER_FRAGMENT)) {
-         kgp_shader_fill_push(info, p, ps);
+      if (by_type[type] != NULL) {
+         kgp_shader_fill_push(info, p, by_type[type]);
       } else if (type == NV9097_SET_PIPELINE_SHADER_TYPE_GEOMETRY &&
                  vs->info->stage == MESA_SHADER_MESH &&
                  vs->info->mesh.has_gs_sph) {
@@ -758,9 +787,8 @@ kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
    kgp_shader_fill_push_vtgm(info, p, vs->info);
 
    bool bound_any_cbuf = false;
-   const struct kgp_gfx_shader *shaders[] = { vs, ps };
-   for (unsigned i = 0; i < ARRAY_SIZE(shaders); i++) {
-      const struct kgp_gfx_shader *shader = shaders[i];
+   for (unsigned i = 0; i < count; i++) {
+      const struct kgp_gfx_shader *shader = &shaders[i];
       if (shader->data_size_B == 0)
          continue;
 
@@ -771,7 +799,7 @@ kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
       P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_C(p, shader->data_addr);
 
       P_IMMD(p, NV9097,
-             BIND_GROUP_CONSTANT_BUFFER(kgp_bind_group(shader->info->stage)), {
+             BIND_GROUP_CONSTANT_BUFFER(kgp_bind_group(shader->info)), {
          .valid = VALID_TRUE,
          .shader_slot = KGP_CBUF_SHADER_DATA,
       });

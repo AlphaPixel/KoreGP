@@ -73,6 +73,7 @@ vkc_init(struct vkc *c, bool transfer_only)
    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
       .meshShader = VK_TRUE,
+      .taskShader = VK_TRUE,
    };
    VkPhysicalDeviceVulkan13Features features13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,

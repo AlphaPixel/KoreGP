@@ -357,7 +357,9 @@ KGP_API void kgpBarrier(KgpCommandBuffer, KGP_STAGE src, KGP_STAGE dst,
  * then the `dst` stages' caches are dropped as kgpBarrier would for
  * `hazards`. The value may come from an earlier kgpSignalAfter or from the
  * CPU, written through the memory's CPU pointer. A wait that is never
- * satisfied blocks the queue until the kernel gives up on the submission.
+ * satisfied blocks the queue until the kernel gives up on the submission
+ * (nouveau: after 10 s); the command buffer then counts as complete and the
+ * device is lost.
  */
 typedef enum KGP_SIGNAL {
    KGP_SIGNAL_SET = 0,
@@ -441,7 +443,10 @@ KGP_API void kgpDrawIndexedInstancedIndirect(KgpCommandBuffer, void *vsData,
 
 /* Mesh shaders. A mesh pipeline has a mesh shader where a graphics pipeline
  * has a vertex shader, reading its root pointer the same way (push-constant
- * offset 0; the pixel shader's is at offset 8). There is no task shader.
+ * offset 0; the pixel shader's is at offset 8). `ts` is an optional task
+ * shader (size 0: none); it reads the mesh shader's root pointer, at
+ * offset 0 as well, and with it the group counts of a draw are the task
+ * shader's, which launches the mesh shader's workgroups itself.
  * The raster desc's topology is ignored: the mesh shader declares its own.
  * A mesh pipeline is drawn only with the two calls below, and they draw
  * nothing else.
@@ -454,8 +459,8 @@ KGP_API void kgpDrawIndexedInstancedIndirect(KgpCommandBuffer, void *vsData,
  * submission wrote it, put a kgpBarrier with KGP_HAZARD_DRAW_ARGUMENTS
  * between the two.
  */
-KGP_API KgpPipeline kgpCreateMeshPipeline(KgpDevice, KgpByteSpan ms,
-                                          KgpByteSpan ps,
+KGP_API KgpPipeline kgpCreateMeshPipeline(KgpDevice, KgpByteSpan ts,
+                                          KgpByteSpan ms, KgpByteSpan ps,
                                           const KgpRasterDesc *,
                                           const KgpSpecialization *constants);
 KGP_API void kgpDrawMeshlets(KgpCommandBuffer, void *msData, void *psData,

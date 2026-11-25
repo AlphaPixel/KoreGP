@@ -81,7 +81,7 @@ step vk_triangle mtest --suite koregp-hardware \
    vk_triangle vk_triangle_indirect vk_triangle_depth vk_triangle_stencil \
    vk_triangle_state vk_triangle_mrt vk_triangle_srgb vk_triangle_rgba16f \
    vk_triangle_rgba32f vk_triangle_r32f vk_triangle_mesh \
-   vk_triangle_meshindirect vk_triangle_msaa
+   vk_triangle_meshindirect vk_triangle_task vk_triangle_msaa
 step triangle mtest --suite koregp-hardware kgp_triangle
 step triangle_indirect mtest --suite koregp-hardware kgp_triangle_indirect
 step textured mtest --suite koregp-hardware kgp_textured
@@ -95,8 +95,11 @@ step multigpu mtest --suite koregp-hardware kgp_triangle_multigpu
 # R10: presentation. A headless swapchain in any window; on the monitor
 # only when nouveau drives one (a window opened by w0.sh present).
 step present mtest --suite koregp-hardware kgp_present
+# The proposal's M2 exit test: the three no_api examples (tests/kgp_noapi.c).
+step noapi mtest --suite koregp-hardware kgp_noapi kgp_noapi_compute    kgp_noapi_playground
 if grep -qx connected /sys/class/drm/card*-*/status 2>/dev/null; then
    step present_display mtest --suite koregp-hardware kgp_present_display
+   step noapi_display mtest --suite koregp-hardware kgp_noapi_triangle_display       kgp_noapi_compute_display kgp_noapi_playground_display
 fi
 
 # R7: a depth target, depth-stencil and blend state; R7b: the same with a
@@ -114,11 +117,21 @@ step formats mtest --suite koregp-hardware kgp_triangle_srgb \
 # The plain scene from a mesh shader, direct and with GPU-read group counts.
 step mesh mtest --suite koregp-hardware kgp_triangle_mesh \
    kgp_triangle_meshindirect
+# The same behind a task shader that passes a payload.
+step task mtest --suite koregp-hardware kgp_triangle_task
 # Four samples per pixel, read back by a shader that averages them.
 step msaa mtest --suite koregp-hardware kgp_triangle_msaa
 # Split barriers. Last of the correctness steps: a wait the hardware never
 # satisfied would hold that process's channel until the kernel times it out.
 step split mtest --suite koregp-hardware kgp_split
+# An observation, not a test (tests/kgp_split.c, "never"): a wait nothing
+# satisfies, held past the kernel's job timeout. Then whether a new process
+# still gets a working channel, and what the kernel said.
+never() { timeout 120 env LD_LIBRARY_PATH="$KGP_PREFIX/lib/x86_64-linux-gnu" \
+             "$KGP_PREFIX/bin/kgp_split" never; }
+STEP_TAIL=8 step split_never never
+step after_never mtest --suite koregp-hardware kgp_saxpy kgp_triangle
+STEP_TAIL=8 step dmesg_never sh -c 'sudo dmesg | grep -i -E "nouveau|gsp|fault" | tail -8'
 
 # If anything KoreGP failed, a rerun of saxpy that narrows it down while the
 # window is open: waiting after every submit, with the pushbuf dumped at the
@@ -129,7 +142,7 @@ case "$failed" in *kgp_*|*copy_*|*heap_*)
    ;;
 esac
 # The same for raster, on the triangle; its own output shows the image.
-case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*state*|*mrt*|*formats*|*mesh*|*msaa*|*multi*|*present*)
+case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*state*|*mrt*|*formats*|*mesh*|*task*|*msaa*|*noapi*|*multi*|*present*)
    tri_dbg() { KGP_DEBUG=sync kgp_run "$KGP_PREFIX/bin/kgp_triangle"; }
    STEP_TAIL=60 step diag_triangle tri_dbg
    ;;
@@ -202,13 +215,15 @@ if [ -x "$REL/bin/bench_dispatch" ]; then
       local args
       # The first workload runs again last: the first GPU benchmark after a
       # driver swap is slow (third window).
-      for args in "saxpy" "saxpy 4194304" "saxpy 16777216 1024" \
+      # Three times at the start, to see whether the slowness is the first
+      # process's alone (thirteenth window: 5.0 ms against 0.63 ms).
+      for args in "saxpy" "saxpy" "saxpy" "saxpy 4194304" "saxpy 16777216 1024" \
                   "loop" "loop 1048576 1024" "saxpy"; do
          # shellcheck disable=SC2086
          gpu $args || return 1
       done
    }
-   STEP_TAIL=10 step bench_gpu run_gpu_bench
+   STEP_TAIL=12 step bench_gpu run_gpu_bench
 else
    echo "== bench: skipped (no release build; KGP_FLAVOR=release build-mesa.sh)"
 fi

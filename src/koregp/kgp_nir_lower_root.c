@@ -28,12 +28,18 @@ load_draw_param(nir_builder *b, nir_intrinsic_instr *intrin, uint32_t offset)
                      .base = offset, .align_mul = 4, .align_offset = 0);
 }
 
+struct lower_root_state {
+   bool has_task;
+   bool bad_push;
+};
+
 static bool
 lower_root_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
    const mesa_shader_stage stage = b->shader->info.stage;
    const bool compute = stage == MESA_SHADER_COMPUTE;
-   bool *bad_push = data;
+   struct lower_root_state *state = data;
+   bool *bad_push = &state->bad_push;
    nir_def *val;
 
    b->cursor = nir_before_instr(&intrin->instr);
@@ -94,9 +100,14 @@ lower_root_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       break;
 
    case nir_intrinsic_load_num_workgroups:
+      /* Behind a task shader the count is the task's to give, and NAK
+       * reads it from where the hardware puts it.
+       */
+      if (stage == MESA_SHADER_MESH && state->has_task)
+         return false;
       if (!compute) {
-         /* A mesh shader's: draw.mesh.group_count, which NVK's mesh draw
-          * macros write.
+         /* A task shader's, or a mesh shader's without one:
+          * draw.mesh.group_count, which NVK's mesh draw macros write.
           */
          val = load_draw_param(b, intrin, 8);
          break;
@@ -130,8 +141,12 @@ lower_root_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
  * pointer; the caller rejects the shader.
  */
 bool
-kgp_nir_lower_root(nir_shader *nir, bool *bad_push_out)
+kgp_nir_lower_root(nir_shader *nir, bool has_task, bool *bad_push_out)
 {
-   return nir_shader_intrinsics_pass(nir, lower_root_intrin,
-                                     nir_metadata_control_flow, bad_push_out);
+   struct lower_root_state state = { .has_task = has_task };
+   const bool progress =
+      nir_shader_intrinsics_pass(nir, lower_root_intrin,
+                                 nir_metadata_control_flow, &state);
+   *bad_push_out = state.bad_push;
+   return progress;
 }

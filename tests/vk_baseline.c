@@ -12,6 +12,8 @@
 #include "scratch_oracle.h"
 #include "scratch_spv.h"
 #include "tri_mesh_ps_spv.h"
+#include "tri_task_ms_spv.h"
+#include "tri_ts_spv.h"
 #include "tri_mrt_ps_spv.h"
 #include "tri_ms_spv.h"
 #include "tri_ps_spv.h"
@@ -467,7 +469,9 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
              uint32_t bench_cbs, uint32_t bench_draws, int mesh, bool msaa)
 {
    /* msaa: four samples, resolved into the second image (tri_scene.h) */
-   /* mesh: 1 = kgpDrawMeshlets, 2 = kgpDrawMeshletsIndirect */
+   /* mesh: 1 = kgpDrawMeshlets, 2 = kgpDrawMeshletsIndirect, 3 = 1 with a
+    * task shader
+    */
    static const VkFormat target_formats[TRI_TARGET_COUNT] = {
       [TRI_TARGET_RGBA8] = VK_FORMAT_R8G8B8A8_UNORM,
       [TRI_TARGET_SRGB8] = VK_FORMAT_R8G8B8A8_SRGB,
@@ -662,6 +666,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
 
    const VkShaderStageFlags root_stages =
       (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
+      (mesh == 3 ? VK_SHADER_STAGE_TASK_BIT_EXT : 0) |
       VK_SHADER_STAGE_FRAGMENT_BIT;
    VkPipelineLayout layout;
    VK_OK(vkCreatePipelineLayout(c->dev, &(VkPipelineLayoutCreateInfo) {
@@ -673,7 +678,9 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       },
    }, NULL, &layout));
 
-   VkShaderModule vs = mesh
+   VkShaderModule vs = mesh == 3
+      ? shader_module(c, tri_task_ms_spv, sizeof(tri_task_ms_spv))
+      : mesh
       ? shader_module(c, tri_ms_spv, sizeof(tri_ms_spv))
       : shader_module(c, tri_vs_spv, sizeof(tri_vs_spv));
    VkShaderModule ps = mesh
@@ -681,7 +688,8 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       : mrt
       ? shader_module(c, tri_mrt_ps_spv, sizeof(tri_mrt_ps_spv))
       : shader_module(c, tri_ps_spv, sizeof(tri_ps_spv));
-   const VkPipelineShaderStageCreateInfo stages[2] = {
+   /* The task stage is last in the array and counted only with mesh == 3. */
+   const VkPipelineShaderStageCreateInfo stages[3] = {
       {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT
@@ -691,6 +699,14 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = ps, .pName = "main",
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+         .module = mesh == 3
+            ? shader_module(c, tri_ts_spv, sizeof(tri_ts_spv))
+            : VK_NULL_HANDLE,
+         .pName = "main",
       },
    };
    const VkViewport viewport = { 0, 0, TRI_W, TRI_H, 0.0f, 1.0f };
@@ -726,7 +742,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
             .stencilAttachmentFormat = stencil ? depth_format
                                                : VK_FORMAT_UNDEFINED,
          },
-         .stageCount = 2,
+         .stageCount = mesh == 3 ? 3 : 2,
          .pStages = stages,
          .pVertexInputState = &(VkPipelineVertexInputStateCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -1061,7 +1077,7 @@ main(int argc, char **argv)
       fprintf(stderr, "usage: %s saxpy|prefix_sum|scratch|indirect|"
               "copy [linear|mip|layer|3d]|"
               "triangle [indirect|depth|stencil|state|mrt|mesh|"
-              "meshindirect|msaa|<format>|"
+              "meshindirect|task|msaa|<format>|"
               "bench [command buffers] [draws]]\n", argv[0]);
       return 2;
    }
@@ -1099,6 +1115,7 @@ main(int argc, char **argv)
                             ? TRI_SCENE_MRT : TRI_SCENE_PLAIN,
                          tri_target_from_arg(argc > 2 ? argv[2] : NULL),
                          0, 0,
+                         argc > 2 && strcmp(argv[2], "task") == 0 ? 3 :
                          argc > 2 && strcmp(argv[2], "mesh") == 0 ? 1 :
                          argc > 2 && strcmp(argv[2], "meshindirect") == 0
                             ? 2 : 0,

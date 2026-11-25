@@ -216,7 +216,7 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 }
 
 static bool
-kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir)
+kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir, bool has_task)
 {
    /* KoreGP has no descriptor sets. Buffers are reached through the root
     * pointer; textures by index into the heap (kgp_nir_lower_heap below).
@@ -229,10 +229,10 @@ kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir)
       return false;
    }
 
-   /* Ancestor: nvk_lower_nir. A mesh shader's workgroup and invocation
-    * ids are derived from indices the hardware provides.
+   /* Ancestor: nvk_lower_nir. A mesh or task shader's workgroup and
+    * invocation ids are derived from indices the hardware provides.
     */
-   const bool mesh = nir->info.stage == MESA_SHADER_MESH;
+   const bool mesh = mesa_shader_stage_is_mesh(nir->info.stage);
    nir_lower_compute_system_values_options csv_options = {
       .lower_local_invocation_index = !mesh,
       .lower_workgroup_id_to_index = mesh,
@@ -263,7 +263,7 @@ kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_constant_folding);
 
    bool bad_push = false;
-   NIR_PASS(_, nir, kgp_nir_lower_root, &bad_push);
+   NIR_PASS(_, nir, kgp_nir_lower_root, has_task, &bad_push);
    if (bad_push) {
       kgp_err("the push-constant block must be exactly one "
               "PhysicalStorageBuffer pointer (the root pointer)%s",
@@ -285,9 +285,11 @@ kgp_lower_nir(struct KgpDevice_T *dev, nir_shader *nir)
             nir_address_format_64bit_global);
 
    if (compute || mesh) {
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+      const nir_variable_mode var_modes =
+         nir_var_mem_shared | (mesh ? nir_var_mem_task_payload : 0);
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, var_modes,
                shared_var_info);
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
+      NIR_PASS(_, nir, nir_lower_explicit_io, var_modes,
                nir_address_format_32bit_offset);
    }
 
@@ -507,7 +509,7 @@ kgpCreateComputePipeline(KgpDevice dev, KgpByteSpan spirv,
    struct nak_shader_bin *bin = NULL;
 
    nak_preprocess_nir(nir, dev->nak);
-   if (!kgp_lower_nir(dev, nir))
+   if (!kgp_lower_nir(dev, nir, false))
       goto fail;
 
    if (dev->debug & KGP_DEBUG_NIR)
@@ -624,21 +626,26 @@ kgp_nir_opts(nir_shader *nir, void *data)
    } while (progress);
 }
 
-/* NVK's own pass, declared in nvk_shader.h, which cannot be included here
- * (kgp_draw.c says why).
+/* NVK's own passes, declared in nvk_shader.h, which cannot be included
+ * here (kgp_draw.c says why).
  */
 bool nvk_nir_lower_mesh_shader(nir_shader *nir,
                                VkShaderCreateFlagsEXT shader_flags);
+bool nvk_nir_lower_task_shader(nir_shader *nir);
 
-/* Ancestor: nvk_lower_nir_late, mesh stage. After linking, as there. A
- * mesh shader's shared memory is in attribute space, allocated in lines of
+/* Ancestor: nvk_lower_nir_late, mesh and task stages. After linking, as
+ * there. Their shared memory is in attribute space, allocated in lines of
  * 128 bytes and written 4 bytes at a time.
  */
 static void
-kgp_lower_mesh_late(nir_shader *nir)
+kgp_lower_mesh_late(nir_shader *nir, bool has_task)
 {
-   NIR_PASS(_, nir, nvk_nir_lower_mesh_shader,
-            VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
+   if (nir->info.stage == MESA_SHADER_TASK) {
+      NIR_PASS(_, nir, nvk_nir_lower_task_shader);
+   } else {
+      NIR_PASS(_, nir, nvk_nir_lower_mesh_shader,
+               has_task ? 0 : VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
+   }
 
    if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
       nir->info.shared_size = align(nir->info.shared_size, 128);
@@ -658,7 +665,7 @@ kgp_lower_mesh_late(nir_shader *nir)
  */
 static nir_shader *
 kgp_gfx_stage_nir(struct KgpDevice_T *dev, KgpByteSpan spirv,
-                  mesa_shader_stage stage, bool mesh_pipeline,
+                  mesa_shader_stage stage, bool mesh_pipeline, bool has_task,
                   struct nir_spirv_specialization *spec)
 {
    nir_shader *nir = kgp_spirv_to_nir(dev, spirv, stage, spec);
@@ -686,7 +693,7 @@ kgp_gfx_stage_nir(struct KgpDevice_T *dev, KgpByteSpan spirv,
       }
    }
 
-   if (!kgp_lower_nir(dev, nir)) {
+   if (!kgp_lower_nir(dev, nir, has_task)) {
       ralloc_free(nir);
       return NULL;
    }
@@ -722,14 +729,18 @@ kgp_gfx_shader_layout(const struct nak_shader_bin *bin, const nir_shader *nir,
 
 /* `first_stage` is the vertex shader's or, for a mesh pipeline, the mesh
  * shader's: without a task shader it sits where the vertex shader does.
+ * `ts` is the optional task shader of a mesh pipeline (size 0: none).
  */
 static KgpPipeline
-kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
-                           const KgpRasterDesc *raster,
+kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan ts, KgpByteSpan vs,
+                           KgpByteSpan ps, const KgpRasterDesc *raster,
                            const KgpSpecialization *constants,
                            mesa_shader_stage first_stage, const char *fn)
 {
    const bool mesh = first_stage == MESA_SHADER_MESH;
+   const bool task = ts.size != 0;
+   /* Stages in pipeline order: [task,] vertex or mesh, pixel. */
+   const unsigned n = task ? 3 : 2;
 
    if (raster == NULL || raster->colorTargetCount == 0 ||
        raster->colorTargetCount > KGP_MAX_COLOR_TARGETS ||
@@ -761,40 +772,47 @@ kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
       return NULL;
    }
 
-   /* Index = mesa stage order, as NVK hands them to the linker. */
-   nir_shader *nirs[2] = { NULL, NULL };
-   struct nak_shader_bin *bins[2] = { NULL, NULL };
+   /* In pipeline order, as NVK hands them to the linker. */
+   nir_shader *nirs[3] = { NULL, NULL, NULL };
+   struct nak_shader_bin *bins[3] = { NULL, NULL, NULL };
    struct KgpPipeline_T *pipeline = NULL;
 
-   nirs[0] = kgp_gfx_stage_nir(dev, vs, first_stage, mesh, spec);
-   nirs[1] = kgp_gfx_stage_nir(dev, ps, MESA_SHADER_FRAGMENT, mesh, spec);
-   /* An id may belong to either stage: checked once both are parsed. */
-   const bool spec_ok = nirs[0] == NULL || nirs[1] == NULL ||
-                        kgp_spec_all_defined(spec);
+   bool parsed = true;
+   for (unsigned i = 0; i < n; i++) {
+      const bool is_task = task && i == 0;
+      nirs[i] = kgp_gfx_stage_nir(dev, is_task ? ts : i == n - 1 ? ps : vs,
+                                  is_task ? MESA_SHADER_TASK :
+                                  i == n - 1 ? MESA_SHADER_FRAGMENT
+                                             : first_stage,
+                                  mesh, task, spec);
+      parsed &= nirs[i] != NULL;
+   }
+   /* An id may belong to any stage: checked once all are parsed. */
+   const bool spec_ok = !parsed || kgp_spec_all_defined(spec);
    vtn_free_specialization(spec);
-   if (nirs[0] == NULL || nirs[1] == NULL || !spec_ok)
+   if (!parsed || !spec_ok)
       goto fail;
 
    /* The only cross-stage linking there is (ancestor: nvk_compile_shaders).
     * What survives it decides the interface the two program headers
     * describe to the hardware.
     */
-   nir_opt_varyings_bulk(nirs, 2, true, UINT32_MAX, UINT32_MAX,
+   nir_opt_varyings_bulk(nirs, n, true, UINT32_MAX, UINT32_MAX,
                          kgp_nir_opts, NULL);
-   if (mesh)
-      kgp_lower_mesh_late(nirs[0]);
+   for (unsigned i = 0; mesh && i < n - 1; i++)
+      kgp_lower_mesh_late(nirs[i], task);
 
    /* Ancestor: nvk_populate_fs_key with pipeline state present: nothing set. */
    const struct nak_fs_key fs_key = { 0 };
    const bool dump_asm = dev->debug & KGP_DEBUG_ASM;
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < n; i++) {
       if (dev->debug & KGP_DEBUG_NIR)
          nir_print_shader(nirs[i], stderr);
 
       bins[i] = nak_compile_shader(nirs[i], dump_asm, dev->nak,
                                    0 /* robust2_modes */,
-                                   i == 1 ? &fs_key : NULL,
-                                   false /* has_task_shader */);
+                                   i == n - 1 ? &fs_key : NULL,
+                                   task /* has_task_shader */);
       if (bins[i] == NULL) {
          kgp_err("internal compiler error in NAK");
          goto fail;
@@ -813,14 +831,14 @@ kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
       goto fail;
    pipeline->graphics = true;
    pipeline->mesh = mesh;
-   pipeline->info = bins[0]->info;
-   pipeline->ps_info = bins[1]->info;
+   pipeline->info = bins[n - 2]->info;
+   pipeline->ps_info = bins[n - 1]->info;
    pipeline->raster = *raster;
 
-   /* Layout: [header | code | constant data] twice, then the overalloc. */
-   uint32_t offset[2], gs_hdr_offset[2], data_offset[2], data_size[2];
+   /* Layout: [header | code | constant data] per stage, then the overalloc. */
+   uint32_t offset[3], gs_hdr_offset[3], data_offset[3], data_size[3];
    uint32_t total_size = 0;
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < n; i++) {
       offset[i] = total_size;
       total_size += kgp_gfx_shader_layout(bins[i], nirs[i], &gs_hdr_offset[i],
                                           &data_offset[i], &data_size[i]);
@@ -842,8 +860,8 @@ kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
    char *image = calloc(1, total_size);
    if (image == NULL)
       goto fail;
-   struct kgp_gfx_shader shaders[2];
-   for (unsigned i = 0; i < 2; i++) {
+   struct kgp_gfx_shader shaders[3];
+   for (unsigned i = 0; i < n; i++) {
       const struct nak_shader_bin *bin = bins[i];
       char *base = image + offset[i];
 
@@ -859,7 +877,7 @@ kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
       }
 
       shaders[i] = (struct kgp_gfx_shader) {
-         .info = i == 0 ? &pipeline->info : &pipeline->ps_info,
+         .info = &bin->info,     /* outlives the build_push below */
          .hdr_addr = mem->va->addr + offset[i],
          .size_B = sizeof(bin->info.hdr) + bin->code_size,
          .gs_hdr_addr = mem->va->addr + offset[i] + gs_hdr_offset[i],
@@ -871,18 +889,18 @@ kgp_create_raster_pipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
    free(image);
    nvkmd_mem_unmap(mem, 0);
 
-   if (!kgp_gfx_pipeline_build_push(kgp_dev_info(dev), pipeline,
-                                    &shaders[0], &shaders[1]))
+   if (!kgp_gfx_pipeline_build_push(kgp_dev_info(dev), pipeline, shaders, n))
       goto fail;
 
-   if (!kgp_device_ensure_slm(dev,
-                              MAX2(bins[0]->info.slm_size,
-                                   bins[1]->info.slm_size),
-                              MAX2(bins[0]->info.crs_size,
-                                   bins[1]->info.crs_size)))
+   uint32_t slm_size = 0, crs_size = 0;
+   for (unsigned i = 0; i < n; i++) {
+      slm_size = MAX2(slm_size, bins[i]->info.slm_size);
+      crs_size = MAX2(crs_size, bins[i]->info.crs_size);
+   }
+   if (!kgp_device_ensure_slm(dev, slm_size, crs_size))
       goto fail;
 
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < n; i++) {
       nak_shader_bin_destroy(bins[i]);
       ralloc_free(nirs[i]);
    }
@@ -895,7 +913,7 @@ fail:
       free(pipeline->gfx_push);
       free(pipeline);
    }
-   for (unsigned i = 0; i < 2; i++) {
+   for (unsigned i = 0; i < n; i++) {
       if (bins[i] != NULL)
          nak_shader_bin_destroy(bins[i]);
       ralloc_free(nirs[i]);
@@ -908,17 +926,17 @@ kgpCreateGraphicsPipeline(KgpDevice dev, KgpByteSpan vs, KgpByteSpan ps,
                           const KgpRasterDesc *raster,
                           const KgpSpecialization *constants)
 {
-   return kgp_create_raster_pipeline(dev, vs, ps, raster, constants,
-                                     MESA_SHADER_VERTEX,
+   return kgp_create_raster_pipeline(dev, (KgpByteSpan) { 0 }, vs, ps,
+                                     raster, constants, MESA_SHADER_VERTEX,
                                      "kgpCreateGraphicsPipeline");
 }
 
 KGP_API KgpPipeline
-kgpCreateMeshPipeline(KgpDevice dev, KgpByteSpan ms, KgpByteSpan ps,
-                      const KgpRasterDesc *raster,
+kgpCreateMeshPipeline(KgpDevice dev, KgpByteSpan ts, KgpByteSpan ms,
+                      KgpByteSpan ps, const KgpRasterDesc *raster,
                       const KgpSpecialization *constants)
 {
-   return kgp_create_raster_pipeline(dev, ms, ps, raster, constants,
+   return kgp_create_raster_pipeline(dev, ts, ms, ps, raster, constants,
                                      MESA_SHADER_MESH,
                                      "kgpCreateMeshPipeline");
 }

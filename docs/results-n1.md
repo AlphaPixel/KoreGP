@@ -242,6 +242,9 @@ run on hardware.
 | `kgp_triangle multigpu` | added 2026-11-24, offline only so far. A compute shader turns four candidate draws into the three records, the count and the per-draw root structs of a multi-draw later in the same command buffer; recorded and submitted. No twin: Vulkan has no spelling for per-draw root data |
 | `kgp_triangle mesh`, `meshindirect`, their `vk_triangle_*` twins and `triangle_matches_nvk_*` | added after the twelfth window, correct on the GPU in the thirteenth. The plain scene from a mesh shader, one workgroup per quad, with a per-primitive output; direct and with the group counts read by the GPU. 324 and 326 methods from render pass to draw, identical to NVK's, the mesh shader's block and its geometry-stage header included |
 | `kgp_triangle msaa`, `vk_triangle_msaa`, `triangle_matches_nvk_msaa` | added after the twelfth window, correct on the GPU in the thirteenth. Four samples, the quads' edges through the middle of a pixel column, read back by a shader that averages the samples through the heap. 325 methods identical to NVK's, sample layout and locations included |
+| `kgp_triangle task`, `vk_triangle_task`, `triangle_matches_nvk_task` | added 2026-11-25, correct on the GPU in the fourteenth window. The mesh scene behind a task shader, one task workgroup per quad, the quad's offset in the payload. 329 methods identical to NVK's |
+| `kgp_noapi`, `kgp_noapi compute`, `kgp_noapi playground` | added 2026-11-25, correct on the GPU in the fourteenth window, headless and on the monitor. The three no_api examples (the proposal's M2 exit test), presenting to a swapchain; the first frame is read back and checked |
+| `kgp_split never` | added 2026-11-25 (offline it records and submits). On hardware an observation of what a never-satisfied wait does, not a test; what it showed is under the fourteenth window |
 | `kgp_split` | added after the twelfth window, correct on the GPU in the thirteenth (offline it records and submits). `kgpSignalAfter` (SET, MAX), `kgpWaitBefore` on a value signalled earlier, and a command buffer the CPU releases by writing the value. No twin |
 
 Every dispatch in the suite also checks, by assertion, that the QMD built
@@ -673,6 +676,51 @@ Dispatch cost: KoreGP 129.2, 130.4, 135.5 and 61.3 ns (the last at 200 x
 
 `bench_gpu`: the first run after the swap was much slower this time (saxpy
 over 16M elements 5.038 ms first, 0.633 ms when repeated last).
+
+## Fourteenth window (2026-11-25 11:26): task shaders, the no_api examples, a wait nothing satisfies
+
+A display window (`w0.sh present`). The tree was commit `54c4a14` plus
+the work listed in `plan.md` under "Added after the thirteenth window",
+not yet committed when the window ran. Every step passed, and the host
+was restored cleanly. First time on the GPU, all correct:
+
+- `kgp_triangle task` and its Vulkan twin: a task shader in front of the
+  mesh shader, the payload carrying each quad's offset;
+- `kgp_noapi`, all three examples, on a headless swapchain and on the
+  monitor: the proposal's M2 exit test. A compute shader stores into the
+  BGRA8 swapchain texture through the heap, and the playground draws
+  over what compute wrote in the same command buffer.
+
+The wait nothing satisfies (`kgp_split never`, an observation):
+
+- the submit is accepted, and nothing happens for 10.48 s; then nouveau
+  reports `job timeout, channel 3 killed!` and the command buffer
+  *counts as complete*: `kgpWait` returns as if it had run;
+- the next `kgpSubmit` on that device fails ("the device is lost"), so
+  writing the value late or submitting again does nothing;
+- `kgp_saxpy` and `kgp_triangle` in new processes right after pass, and
+  the kernel log has the one timeout line and nothing else.
+
+So the cost of an unsatisfied wait is that process's device, after 10 s,
+and the completion of the waiting command buffer is not evidence that it
+ran: only the failed submit after it says so. `kgp.h` now says this.
+
+`bench_gpu`: the 5 ms first run of the thirteenth window did not come
+back. Saxpy over 16M elements, three processes at the start: 0.826,
+0.821 and 0.787 ms; the same workload last: 0.615 ms. So it is not the
+first process that is slow but the first while after the swap (the
+twelfth window's 0.790 against 0.599 ms is the same picture), and the
+5 ms was a one-off this window does not explain.
+
+Draw cost, release build, 2000 x 100 three times, then 500 x 1000:
+KoreGP 62.7, 77.9, 59.8 and 40.3 ns per draw against NVK's 105.1, 109.4,
+113.6 and 74.1. Dispatch cost: KoreGP 105.4, 95.0, 106.3 and 61.9 ns
+(the last at 200 x 1000) against NVK's 446.5, 467.7, 444.4 and 429.2.
+The 1000-draw figures are higher for both than in the thirteenth window
+(26.6 and 63.0); each is one run.
+
+`strace`: 12 `VM_BIND` with 8 command buffers and 12 with 800 (27 and 819
+`EXEC`), unchanged.
 
 ## Memory safety
 

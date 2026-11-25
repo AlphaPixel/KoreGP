@@ -19,7 +19,8 @@
  * shader in the same command buffer (tri_scene.h). "bench" times the
  * recording of draws instead of checking one (tri_scene.h). A format's
  * name ("srgb", "rgba16f", "rgba32f", "r32f") draws the plain scene into a
- * target of that format. "mesh" draws the plain scene from a mesh shader,
+ * target of that format. "task" is "mesh" behind a task shader that passes each
+ * quad's offset in its payload. "mesh" draws the plain scene from a mesh shader,
  * one workgroup per quad, with a per-primitive output; "meshindirect" has
  * the GPU read its group counts. "msaa" draws into a four-sample target
  * and reads it back with a shader that averages the samples (tri_scene.h).
@@ -33,6 +34,8 @@
 #include "tri_mesh_ps_spv.h"
 #include "tri_mrt_ps_spv.h"
 #include "tri_ms_spv.h"
+#include "tri_task_ms_spv.h"
+#include "tri_ts_spv.h"
 #include "tri_ps_spv.h"
 #include "tri_resolve_spv.h"
 #include "tri_scene.h"
@@ -53,7 +56,9 @@ main(int argc, char **argv)
    const bool mrt = argc > 1 && strcmp(argv[1], "mrt") == 0;
    const bool msaa = argc > 1 && strcmp(argv[1], "msaa") == 0;
    const bool meshind = argc > 1 && strcmp(argv[1], "meshindirect") == 0;
-   const bool mesh = meshind || (argc > 1 && strcmp(argv[1], "mesh") == 0);
+   const bool task = argc > 1 && strcmp(argv[1], "task") == 0;
+   const bool mesh = meshind || task ||
+                     (argc > 1 && strcmp(argv[1], "mesh") == 0);
    const bool multigpu = argc > 1 && strcmp(argv[1], "multigpu") == 0;
    const bool multi = multigpu || (argc > 1 && strcmp(argv[1], "multi") == 0);
    const bool bench = argc > 1 && strcmp(argv[1], "bench") == 0;
@@ -255,8 +260,10 @@ main(int argc, char **argv)
       },
    };
    KgpPipeline pipeline = mesh
-      ? kgpCreateMeshPipeline(dev, SPAN(tri_ms_spv), SPAN(tri_mesh_ps_spv),
-                              &raster, NULL)
+      ? kgpCreateMeshPipeline(dev,
+                              task ? SPAN(tri_ts_spv) : (KgpByteSpan) { 0 },
+                              task ? SPAN(tri_task_ms_spv) : SPAN(tri_ms_spv),
+                              SPAN(tri_mesh_ps_spv), &raster, NULL)
       : kgpCreateGraphicsPipeline(
            dev, SPAN(tri_vs_spv),
            mrt ? SPAN(tri_mrt_ps_spv) : SPAN(tri_ps_spv), &raster, NULL);

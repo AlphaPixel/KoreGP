@@ -17,12 +17,15 @@ Milestones here are named so they cannot be confused with the proposal's:
 | N3 | M2 | raster | **first triangle correct on hardware** (2026-11-22, R1–R6), as is a heap texture sampled in a pixel shader (R8). Indirect draw (R9a) correct on hardware too. Depth and the depth-stencil and blend state objects (R7) correct on hardware (fourth window). GPU-driven multi-draw (R9b) correct on hardware (fifth window, 2026-11-23). Stencil (R7b) correct on hardware only with the texture mapped under its PTE kind, which is now what the code does. Presentation (R10) correct on hardware to a headless swapchain (seventh window); on the monitor not yet run |
 | — | M3, M4, §9 | not planned here (see "Deferred") | |
 
-## State on 2026-11-24
+## State on 2026-11-25
 
-On hardware, thirteen windows (`results-n1.md`). The thirteenth
+On hardware, fourteen windows (`results-n1.md`). The fourteenth
+(2026-11-25 11:26) passed every step, among them task shaders and the
+three no_api examples (the proposal's M2 exit test) for the first time,
+headless and on the monitor; nothing in the tree is now unverified on the
+GPU. The thirteenth
 (2026-11-24 23:56) passed every step, among them mesh shaders, MSAA and
-split barriers for the first time; nothing in the tree is now unverified
-on the GPU. The twelfth (2026-11-24
+split barriers for the first time. The twelfth (2026-11-24
 18:06, commit `26f0c8d`) passed every step, among them everything added
 since the eleventh: raster state, two colour targets, the other target
 formats, sub-resource copies, the compute-written multi-draw, the
@@ -84,6 +87,40 @@ Next, in dependency order:
   false alarm). `kgp_validate` passed on the GPU in the ninth window.
   The NIR-injected bounds checks on heap indexing were added after it
   (2026-11-24) and are correct on the GPU (twelfth window).
+
+Added after the thirteenth window (2026-11-25; 88 offline tests pass,
+also under `KGP_DEBUG=1`, and the new programs are clean under the
+sanitizers). All of it ran on the GPU in the fourteenth window: the tests
+are correct, and what the two observations showed is in `results-n1.md`.
+The risks named below are what was expected before it:
+
+- **Task shaders.** `kgpCreateMeshPipeline` takes an optional task shader
+  first. It sits in the vertex shader's slot and the mesh shader moves to
+  the tessellation evaluation slot, as in NVK; both read the mesh stage's
+  root pointer, since the root table is visible to every binding group.
+  The group counts of a draw become the task shader's. `kgp_triangle
+  task` passes each quad's offset in the payload; its Vulkan twin and
+  `triangle_matches_nvk_task` agree on 329 methods. Risk on hardware:
+  medium (the payload path through NAK under KoreGP's lowering).
+- **The proposal's M2 exit test**: the no_api example set ported
+  (`tests/kgp_noapi.c`, which lists what is not the original's):
+  hello_triangle, hello_compute and playground, each presenting to a
+  swapchain, headless in any window and on the monitor in a `w0.sh
+  present` window. New ground for the implementation: a compute shader
+  storing into a swapchain texture through the heap (BGRA8 as a storage
+  image), and drawing over what compute wrote in the same command
+  buffer. No Vulkan twins: every call they make already has one. Risk on
+  hardware: medium, in the BGRA8 image store.
+- **A wait nothing satisfies** (`kgp_split never`): an observation, not a
+  test. It holds a channel past nouveau's job timeout, then says whether
+  the command buffer completed, whether writing the value late releases
+  it, and whether the device takes another submit; the suite then runs
+  two ordinary tests in new processes and prints the kernel's log. Risk:
+  high that the device is lost for that process (expected), low for the
+  host: a timed-out job is nouveau's ordinary path for a hung channel.
+- `bench_gpu` runs its first workload three times at the start, to see
+  whether the slow first run (5.0 ms against 0.63 ms in the thirteenth
+  window) is the first process's alone.
 
 Added after the twelfth window (2026-11-24; 81 offline tests pass, also
 under `KGP_DEBUG=1`, and the new ones are clean under the sanitizers).
@@ -502,8 +539,7 @@ default. libkoregp.so now links most of NVK (the macro builders live in
 
 ## Deferred
 
-- Task shaders (mesh shaders are in, without them), SDK packaging
-  (proposal M3).
+- SDK packaging (proposal M3).
 - AMD/RADV backend (the proposal's reference target; needs AMD hardware).
 - The layered Vulkan ICD, ICD loader, CMake config, vcpkg port (§9). The
   shared SPIR-V root ABI (D5) is chosen so this stays possible: the test

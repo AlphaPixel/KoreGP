@@ -23,6 +23,14 @@ layout(buffer_reference, scalar) readonly buffer TriVsRoot {
 
 layout(push_constant, scalar) uniform Push { TriVsRoot root; };
 
+#ifdef TASK
+// Behind tri.task: the quad's offset comes in the payload.
+struct TriPayload {
+   float offset;
+};
+taskPayloadSharedEXT TriPayload payload;
+#endif
+
 layout(local_size_x = 1) in;
 layout(triangles, max_vertices = 4, max_primitives = 2) out;
 
@@ -34,8 +42,12 @@ void main()
    SetMeshOutputsEXT(4, 2);
    for (uint i = 0; i < 4; i++) {
       Vertex v = root.vertices.v[i];
+#ifdef TASK
+      vec2 pos = v.pos + vec2(payload.offset, 0.0);
+#else
       vec2 pos = v.pos +
                  vec2(root.instanceStep * float(gl_WorkGroupID.x), 0.0);
+#endif
       gl_MeshVerticesEXT[i].gl_Position = vec4(pos, root.z, 1.0);
       color[i] = v.color;
    }
