@@ -231,7 +231,7 @@ run on hardware.
 | `kgp_info` | device open through nvkmd with no Vulkan object (D8) |
 | `kgp_saxpy`, `kgp_prefix_sum`, `kgp_scratch`, `kgp_indirect` | SPIR-V → NIR → NAK with the root convention; memory, pointers, pipelines, recording, barriers, indirect dispatch, multi-buffer submit, semaphores all run |
 | `kgp_reject` | bad SPIR-V, an oversized push-constant block, descriptor-set resources, bad sizes, pointers and submits are refused with an error, not a crash |
-| `kgp_validate` | (Since 2026-11-24 also the shader-side heap bounds check, which no window has run.) Under `KGP_DEBUG=1`: a CPU pointer as a root, a misaligned root, copies one byte past an allocation, a heap larger than its memory, barriers with empty or unknown stages, a texture over memory too small for it and a command buffer whose memory was freed before submit are all refused; correct use of the same calls is not |
+| `kgp_validate` | (Since 2026-11-24 also the shader-side heap bounds check, correct on the GPU in the twelfth window.) Under `KGP_DEBUG=1`: a CPU pointer as a root, a misaligned root, copies one byte past an allocation, a heap larger than its memory, barriers with empty or unknown stages, a texture over memory too small for it and a command buffer whose memory was freed before submit are all refused; correct use of the same calls is not |
 | `vk_saxpy`, `vk_prefix_sum`, `vk_scratch`, `vk_indirect` | the Vulkan twins build and run on the same NVK |
 | `push_matches_nvk_*` (4) | **KoreGP pushes exactly what NVK pushes** |
 | `no_bind_per_submit` | 4 VA binds whether 8 or 800 command buffers are submitted |
@@ -325,8 +325,8 @@ cleverness in the frontend, it is state the API no longer has.
 
 ## Draw cost, offline
 
-Measured 2026-11-24, on the shim, release build; not yet on hardware (the
-suite's `bench_draw` step runs it in the next window).
+Measured 2026-11-24, on the shim, release build. On hardware: "Twelfth
+window" below, 65 - 73 ns against 103 - 106 ns at 100 draws per buffer.
 
 `kgp_triangle bench` and `vk_baseline triangle bench` (`tests/tri_scene.h`):
 N command buffers, each one render pass with a clear, the pipeline set
@@ -586,6 +586,49 @@ included, which confirms the cause found after the tenth window.
   `nvidia-drmdrmfb`, "host state restored"; no warning, oops or Xid in
   the kernel log.
 - Dispatch recording, release flavor: KoreGP 108-133 ns, NVK 790-794 ns.
+
+## Twelfth window (2026-11-24 18:06): everything added since the eleventh
+
+Commit `26f0c8d`. Every step passed, and the host was restored cleanly.
+First time on the GPU, all correct:
+
+- `kgp_triangle state` (depth bias, blend constants and constant factors,
+  colour write masks), `mrt` (two colour targets), `srgb`, `rgba16f`,
+  `rgba32f`, `r32f`, each with its Vulkan twin;
+- `kgp_triangle multigpu`: a multi-draw whose arguments, count and per-draw
+  roots a compute shader wrote earlier in the same command buffer;
+- `kgp_copy mip`, `layer` and `3d`, which is the first check of the mip and
+  layer start offsets (the offline comparison masks addresses);
+- the shader-side heap bounds check in `kgp_validate`: the fetch inside the
+  declared count returns the texel, the one past it returns zero;
+- the suite without root convention v1.
+
+Draw cost, release build, 2000 command buffers of 100 draws, three runs
+alternating the two APIs:
+
+| | Record, ns per draw | Submit, us per command buffer |
+|---|---|---|
+| KoreGP | 64.5 - 73.3 | 7.8 - 8.8 |
+| NVK through Vulkan | 103.3 - 105.7 | 8.4 - 8.6 |
+
+About 1.6 times less CPU per draw. Offline the same shape gives 29 - 44 ns
+against 80 - 112 ns: on the card both sides pay about 35 to 40 ns more per
+draw, which is writing the pushbuf into write-combined memory instead of
+RAM, so the difference between the two is about what it is offline and the
+ratio is smaller. At 100 draws per command buffer the figure also includes
+the per-buffer work (render pass, state, shaders). The 500 x 1000 shape of
+the offline table was not run in the window.
+
+Dispatch cost, same method as before: KoreGP 90.4, 95.2, 108.9 and 140.0 ns
+against NVK's 444.4, 560.9, 811.0 and 838.2 ns, between 4.7 and 7.4 times.
+
+`strace`: 12 `VM_BIND` with 8 command buffers and 12 with 800 (27 and 819
+`EXEC`). The count was 8 in the first window; the device makes more
+allocations at start-up now. It still does not depend on the number of
+submits, which is the claim.
+
+`bench_gpu`: the first run after the swap is again the slow one (saxpy
+over 16M elements 0.790 ms first, 0.599 ms when repeated last).
 
 ## Memory safety
 

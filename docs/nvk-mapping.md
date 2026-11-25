@@ -435,8 +435,8 @@ the proposal's claim that the model is vendor-neutral; D2–D4 are exactly the
 
 - `KGP_DEBUG=1` checks: vendor-neutral, and written (`kgp_validate.c`,
   test `kgp_validate`), the NIR-injected bounds checks on heap indexing
-  included since 2026-11-24 (`kgp_nir_lower_heap.c`; they have not run on
-  a GPU). A pipeline created under validation compares each heap index
+  included since 2026-11-24 (`kgp_nir_lower_heap.c`; correct on
+  the GPU, twelfth window). A pipeline created under validation compares each heap index
   with the number of entries the command buffer gave the heap, and skips
   the access when it is past the end: a read gives zero, a write is
   dropped. The two counts reach a compute shader in the root record and a

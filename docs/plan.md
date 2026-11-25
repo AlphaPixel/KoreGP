@@ -17,9 +17,15 @@ Milestones here are named so they cannot be confused with the proposal's:
 | N3 | M2 | raster | **first triangle correct on hardware** (2026-11-22, R1–R6), as is a heap texture sampled in a pixel shader (R8). Indirect draw (R9a) correct on hardware too. Depth and the depth-stencil and blend state objects (R7) correct on hardware (fourth window). GPU-driven multi-draw (R9b) correct on hardware (fifth window, 2026-11-23). Stencil (R7b) correct on hardware only with the texture mapped under its PTE kind, which is now what the code does. Presentation (R10) correct on hardware to a headless swapchain (seventh window); on the monitor not yet run |
 | — | M3, M4, §9 | not planned here (see "Deferred") | |
 
-## State on 2026-11-23
+## State on 2026-11-24
 
-On hardware, eleven windows (`results-n1.md`). The eleventh (2026-11-23
+On hardware, twelve windows (`results-n1.md`). The twelfth (2026-11-24
+18:06, commit `26f0c8d`) passed every step, among them everything added
+since the eleventh: raster state, two colour targets, the other target
+formats, sub-resource copies, the compute-written multi-draw, the
+shader-side heap bounds check, and the draw benchmark (65 - 73 ns a draw
+against NVK's 103 - 106). Nothing in the tree is now unverified on the
+GPU. The eleventh (2026-11-23
 19:17) presented 120 frames on the monitor through `kgp_present display`,
 which completes R10 as far as a test can check it. The seventh (2026-11-23
 11:46) ran specialization constants and presentation to a headless
@@ -47,7 +53,7 @@ objects, for the first time, and it is correct with the depth texture in
 ordinary memory: D4 is answered for depth as for colour. Unverified on
 hardware is only what the tests do not reach (copies of non-zero mips,
 layers and 3D textures, and render targets in formats other than RGBA8:
-all have tests since 2026-11-24 that no window has run).
+all correct in the twelfth window).
 
 Next, in dependency order:
 
@@ -75,9 +81,9 @@ Next, in dependency order:
   (`kgp_validate`; the whole offline suite also passes with it on, with no
   false alarm). `kgp_validate` passed on the GPU in the ninth window.
   The NIR-injected bounds checks on heap indexing were added after it
-  (2026-11-24) and have not run on a GPU.
+  (2026-11-24) and are correct on the GPU (twelfth window).
 
-Since the last window (2026-11-24, offline only):
+Added on 2026-11-24 (all run on the GPU in the twelfth window):
 
 - Draw cost against NVK (`results-n1.md`, "Draw cost, offline"): about a
   third of the CPU per recorded draw. The index buffer is now bound when
@@ -117,8 +123,7 @@ Since the last window (2026-11-24, offline only):
   `kgp_validate` now also fetches through an index inside the heap and
   one past its declared end, where a valid descriptor lies, and expects
   the texture and zero. Offline the whole suite passes with the checks
-  compiled in; the result is for the next window. Medium: the checks add
-  control flow around every texture access, which no window has run.
+  compiled in; on the GPU it is correct (twelfth window).
 
 Done before the window:
 
@@ -468,6 +473,10 @@ default. libkoregp.so now links most of NVK (the macro builders live in
 
 ## Feeding back to the proposal
 
-Deltas D1–D9 in `nvk-mapping.md` are candidate edits to the proposal's §5–§6.
-They are recorded here, not applied to `KoreGP-website`, until hardware
-confirms them.
+Written 2026-11-24 as a page of the site,
+`KoreGP-website/docs/nvk-test-implementation.md`: what runs, the measured
+costs against NVK, how each section of the proposal translated, and the
+deltas of `nvk-mapping.md` as nine suggested edits. The proposal's own text
+is not edited beyond a pointer to that page; folding the edits into §5–§6
+is the author's call. Update the page when a window changes a figure (the
+draw cost is offline only there).
