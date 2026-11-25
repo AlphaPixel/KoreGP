@@ -255,6 +255,12 @@ kgp_copy_texture(KgpCommandBuffer cb, KgpTexture tex, uint32_t mip,
       cb->failed = true;
       return;
    }
+   if (unlikely(image->sample_layout != NIL_SAMPLE_LAYOUT_1X1)) {
+      kgp_err("%s: a multisampled texture is read by a shader, not copied",
+              func);
+      cb->failed = true;
+      return;
+   }
 
    const struct nil_image_level *level = &image->levels[mip];
    struct nil_Extent4D_Elements extent_el =

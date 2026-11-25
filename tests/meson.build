@@ -10,7 +10,7 @@ kgp_glslang = find_program('glslangValidator', native : true)
 kgp_spv = {}
 foreach name : ['saxpy', 'prefix_sum', 'scratch', 'genargs', 'rootloop',
                 'heap_copy', 'heap_fetch', 'heap_sample', 'heap_store',
-                'bad_push', 'bad_ubo', 'spec', 'multi_gen']
+                'bad_push', 'bad_ubo', 'spec', 'multi_gen', 'tri_resolve']
   kgp_spv += {
     name : custom_target(
       name + '_spv.h',
@@ -43,6 +43,7 @@ endforeach
 # Raster shaders: glslang takes the stage from the file extension.
 foreach name, file : {'tri_vs' : 'tri.vert', 'tri_ps' : 'tri.frag',
                       'tri_mrt_ps' : 'tri_mrt.frag', 'tex_ps' : 'tex.frag',
+                      'tri_ms' : 'tri.mesh', 'tri_mesh_ps' : 'tri_mesh.frag',
                       'bad_ps_push' : 'bad_ps_push.frag'}
   kgp_spv += {
     name : custom_target(
@@ -65,6 +66,7 @@ kgp_offline_env.set('KGP_TEST_OFFLINE', '1')
 kgp_tests = {
   'kgp_info' : [],
   'kgp_saxpy' : [kgp_spv['saxpy']],
+  'kgp_split' : [kgp_spv['saxpy']],
   'kgp_prefix_sum' : [kgp_spv['prefix_sum']],
   'kgp_scratch' : [kgp_spv['scratch']],
   'kgp_indirect' : [kgp_spv['saxpy'], kgp_spv['genargs']],
@@ -75,7 +77,9 @@ kgp_tests = {
   'kgp_gfx_pipeline' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'],
                         kgp_spv['bad_ps_push'], kgp_spv['saxpy']],
   'kgp_triangle' : [kgp_spv['tri_vs'], kgp_spv['tri_ps'], kgp_spv['saxpy'],
-                    kgp_spv['multi_gen'], kgp_spv['tri_mrt_ps']],
+                    kgp_spv['multi_gen'], kgp_spv['tri_mrt_ps'],
+                    kgp_spv['tri_ms'], kgp_spv['tri_mesh_ps'],
+                    kgp_spv['tri_resolve']],
   'kgp_textured' : [kgp_spv['tri_vs'], kgp_spv['tex_ps']],
   'kgp_reject' : [kgp_spv['saxpy'], kgp_spv['bad_push'], kgp_spv['bad_ubo']],
   'kgp_spec' : [kgp_spv['spec'], kgp_spv['tri_vs'], kgp_spv['tri_ps']],
@@ -132,7 +136,8 @@ test('kgp_triangle_indirect', kgp_exes['kgp_triangle'], args : ['indirect'],
 # with a compute shader writing everything the multi-draw reads.
 # Last, into render targets of other formats.
 foreach variant : ['depth', 'stencil', 'state', 'mrt', 'multi', 'multigpu',
-                   'srgb', 'rgba16f', 'rgba32f', 'r32f']
+                   'srgb', 'rgba16f', 'rgba32f', 'r32f', 'mesh',
+                   'meshindirect', 'msaa']
   test('kgp_triangle_' + variant, kgp_exes['kgp_triangle'], args : [variant],
        suite : ['koregp-offline'], env : kgp_offline_env,
        depends : libnouveau_noop_drm_shim)
@@ -172,7 +177,8 @@ if dep_vulkan_loader.found()
     'vk_baseline',
     ['vk_baseline.c', kgp_spv['saxpy'], kgp_spv['prefix_sum'],
      kgp_spv['scratch'], kgp_spv['genargs'], kgp_spv['tri_vs'],
-     kgp_spv['tri_ps'], kgp_spv['tri_mrt_ps']],
+     kgp_spv['tri_ps'], kgp_spv['tri_mrt_ps'], kgp_spv['tri_ms'],
+     kgp_spv['tri_mesh_ps']],
     dependencies : dep_vulkan_loader,
     include_directories : inc_koregp,
     install : true,
@@ -202,7 +208,8 @@ if dep_vulkan_loader.found()
        depends : [libvulkan_nouveau, _dev_icd])
 
   foreach variant : [[], ['indirect'], ['depth'], ['stencil'], ['state'],
-                     ['mrt'], ['srgb'], ['rgba16f'], ['rgba32f'], ['r32f']]
+                     ['mrt'], ['srgb'], ['rgba16f'], ['rgba32f'], ['r32f'],
+                     ['mesh'], ['meshindirect'], ['msaa']]
     suffix = variant.length() > 0 ? '_' + variant[0] : ''
     test('triangle_matches_nvk' + suffix, find_program('sh'),
          args : [files('triangle_matches_nvk.sh'),

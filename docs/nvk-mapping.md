@@ -375,8 +375,39 @@ between dispatches does need the invalidate: either a `KGP_HAZARD_ROOT_DATA`
 bit or `nak_set_invalidate_cache` per QMD. N1.H decided it: v1 was not
 adopted, so the hazard bit is not needed.
 
-Split barriers: `WAIT_FOR_IDLE` plus a GPU-side semaphore write is the likely
-form *(verify at N3+)*.
+Split barriers (written 2026-11-24, correct on the GPU in the thirteenth
+window): the proposal's
+"RELEASE_MEM and WAIT_REG_MEM against a raw user VA" has a direct
+counterpart in the channel's semaphore methods (class C36F, `SEM_ADDR`,
+`SEM_PAYLOAD`, `SEM_EXECUTE`), which NVK does not use. `kgpSignalAfter` is
+the producer half of `kgpBarrier` followed by a release with wait-for-idle:
+the GPU stores a 64-bit payload at the address, or the unsigned maximum of
+it and what is there (the method's reduction operation). `kgpWaitBefore`
+is an acquire, which holds the channel until the memory equals the payload
+or is at least it, followed by the consumer half. The memory is ordinary
+`kgpMalloc` memory, so the CPU can release a waiting GPU by writing it.
+What the hardware asks: an address below 2^40, 4-byte aligned (the API
+says 8, for the 64-bit payload). The proposal's "caller's atomic op and
+compare" is here two of each (set and max; equal and greater-or-equal);
+the method has more.
+
+Mesh shaders (written 2026-11-24, correct on the GPU in the thirteenth
+window): NVK has them on
+Turing and KoreGP takes them as they are. A mesh shader without a task
+shader is bound in the vertex shader's slot and binding group, so root
+table 7 serves it as it serves a vertex shader; its group counts are in
+root table 0, where NVK's mesh draw macros put them and where
+`gl_NumWorkGroups` is read. Per-primitive outputs need a second program
+header for the geometry stage, which NAK generates. No task shader:
+`kgpDrawMeshlets` takes the group counts a task shader would have
+computed.
+
+MSAA (written 2026-11-24, correct on the GPU in the thirteenth window): the sample count is a
+property of the texture's layout (NIL) and of the render pass; sample
+locations are Vulkan's standard ones, sent as NVK sends them. Delta D4
+for multisampled textures is not asked: they are mapped under their PTE
+kind, as NVK maps them. The proposal has no resolve; here a shader reads
+the samples through the heap.
 
 ## §5.6 Presentation
 

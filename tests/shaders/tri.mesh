@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+// The "mesh" variant's mesh shader (tri_scene.h): tri.vert's quad, one per
+// workgroup, with the workgroup index where tri.vert has the instance
+// index. Same root struct. The per-primitive output makes the hardware
+// need a geometry-stage header next to the mesh program.
+
+struct Vertex {
+   vec2 pos;
+   vec4 color;
+};
+
+layout(buffer_reference, scalar) readonly buffer VertexArray { Vertex v[]; };
+
+layout(buffer_reference, scalar) readonly buffer TriVsRoot {
+   VertexArray vertices;
+   float instanceStep;
+   float z;
+};
+
+layout(push_constant, scalar) uniform Push { TriVsRoot root; };
+
+layout(local_size_x = 1) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+layout(location = 0) out vec4 color[];
+layout(location = 1) perprimitiveEXT out vec4 primColor[];
+
+void main()
+{
+   SetMeshOutputsEXT(4, 2);
+   for (uint i = 0; i < 4; i++) {
+      Vertex v = root.vertices.v[i];
+      vec2 pos = v.pos +
+                 vec2(root.instanceStep * float(gl_WorkGroupID.x), 0.0);
+      gl_MeshVerticesEXT[i].gl_Position = vec4(pos, root.z, 1.0);
+      color[i] = v.color;
+   }
+   // tri_fill's index list
+   gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+   gl_PrimitiveTriangleIndicesEXT[1] = uvec3(0, 2, 3);
+   primColor[0] = root.vertices.v[0].color;
+   primColor[1] = root.vertices.v[3].color;
+}

@@ -169,6 +169,13 @@ typedef struct KgpTextureDesc {
    uint32_t layerCount;   /* 0 or 1: not an array */
    uint32_t mipCount;     /* 0 means 1 */
    uint32_t flags;        /* KGP_TEXTURE_FLAGS */
+   /* 0 or 1: not multisampled; else 2, 4 or 8. A multisampled texture is
+    * 2D, tiled, with one level and no layers, and lies in KGP_MEMORY_GPU
+    * memory, page-aligned within its allocation. It is a render target,
+    * and a shader reads its samples through the heap (sampler2DMS,
+    * texelFetch); there is no resolve call and it cannot be copied.
+    */
+   uint32_t sampleCount;
 } KgpTextureDesc;
 
 typedef struct KgpSizeAlign {
@@ -296,6 +303,11 @@ typedef struct KgpRasterDesc {
     * the blend state's colorWrite both allow it.
     */
    uint32_t colorWrite[KGP_MAX_COLOR_TARGETS];
+   /* The sample count of the render pass's targets: 0 or 1, 2, 4 or 8.
+    * Sample locations are Vulkan's standard ones.
+    */
+   uint32_t sampleCount;
+   bool alphaToCoverage;
 } KgpRasterDesc;
 
 /* A vertex and a pixel shader, SPIR-V 1.3+, entry points "main". There are
@@ -330,6 +342,35 @@ KGP_API void kgpDispatchIndirect(KgpCommandBuffer, void *dataGpu,
                                  void *groupsGpu);
 KGP_API void kgpBarrier(KgpCommandBuffer, KGP_STAGE src, KGP_STAGE dst,
                         KGP_HAZARD hazards);
+
+/* Split barriers: the two halves of kgpBarrier, joined by a 64-bit value in
+ * memory instead of by their place in one command buffer. valueGpu is a GPU
+ * pointer, 8-byte aligned, below 2^40.
+ *
+ * kgpSignalAfter: once everything recorded so far for the `src` stages has
+ * finished and its writes are out of the caches, the GPU stores `value`
+ * (KGP_SIGNAL_SET) or the larger of it and what is there, unsigned
+ * (KGP_SIGNAL_MAX).
+ *
+ * kgpWaitBefore: nothing recorded after it runs until the memory holds
+ * `value` (KGP_WAIT_EQUAL) or at least it, unsigned (KGP_WAIT_GREATER_EQUAL);
+ * then the `dst` stages' caches are dropped as kgpBarrier would for
+ * `hazards`. The value may come from an earlier kgpSignalAfter or from the
+ * CPU, written through the memory's CPU pointer. A wait that is never
+ * satisfied blocks the queue until the kernel gives up on the submission.
+ */
+typedef enum KGP_SIGNAL {
+   KGP_SIGNAL_SET = 0,
+   KGP_SIGNAL_MAX,
+} KGP_SIGNAL;
+typedef enum KGP_WAIT {
+   KGP_WAIT_EQUAL = 0,
+   KGP_WAIT_GREATER_EQUAL,
+} KGP_WAIT;
+KGP_API void kgpSignalAfter(KgpCommandBuffer, KGP_STAGE src, void *valueGpu,
+                            uint64_t value, KGP_SIGNAL op);
+KGP_API void kgpWaitBefore(KgpCommandBuffer, KGP_STAGE dst, void *valueGpu,
+                           uint64_t value, KGP_WAIT op, KGP_HAZARD hazards);
 /* Raster. A render pass names the textures drawn into: on every current GPU
  * that is state the CPU must program, so it takes KgpTexture handles. The
  * area is the whole of the targets, which must all have the same extent;
@@ -397,6 +438,30 @@ typedef struct KgpDrawIndexedArgs {
 KGP_API void kgpDrawIndexedInstancedIndirect(KgpCommandBuffer, void *vsData,
                                              void *psData, void *indicesGpu,
                                              void *argsGpu);
+
+/* Mesh shaders. A mesh pipeline has a mesh shader where a graphics pipeline
+ * has a vertex shader, reading its root pointer the same way (push-constant
+ * offset 0; the pixel shader's is at offset 8). There is no task shader.
+ * The raster desc's topology is ignored: the mesh shader declares its own.
+ * A mesh pipeline is drawn only with the two calls below, and they draw
+ * nothing else.
+ *
+ * kgpDrawMeshlets runs groups.x * groups.y * groups.z workgroups of the
+ * mesh shader (at most 2^22 in all, Y and Z at most 65535 each); the
+ * shader sees gl_WorkGroupID and gl_NumWorkGroups as a compute shader
+ * does. The indirect form reads a KgpUvec3 at groupsGpu (a GPU pointer,
+ * 4-byte aligned) at execution time; if something earlier in the
+ * submission wrote it, put a kgpBarrier with KGP_HAZARD_DRAW_ARGUMENTS
+ * between the two.
+ */
+KGP_API KgpPipeline kgpCreateMeshPipeline(KgpDevice, KgpByteSpan ms,
+                                          KgpByteSpan ps,
+                                          const KgpRasterDesc *,
+                                          const KgpSpecialization *constants);
+KGP_API void kgpDrawMeshlets(KgpCommandBuffer, void *msData, void *psData,
+                             KgpUvec3 groups);
+KGP_API void kgpDrawMeshletsIndirect(KgpCommandBuffer, void *msData,
+                                     void *psData, void *groupsGpu);
 
 /* GPU-driven multi-draw with per-draw root data. At execution time the GPU
  * reads a uint32 draw count at countGpu (capped at maxDrawCount) and that

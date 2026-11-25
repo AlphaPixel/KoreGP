@@ -344,6 +344,54 @@ tri_check_target(const char *what, const void *got, int target)
    return 0;
 }
 
+/* The "msaa" variant: the plain scene into a four-sample target, moved
+ * half a pixel to the right so that the quads' vertical edges cut through
+ * pixels. With the standard sample locations two of the four samples lie
+ * on each side of a pixel's centre line, so the edge columns resolve to
+ * half red:
+ *
+ *    x = 8, 24, 40, 56   half red (0x7f or 0x80)
+ *    (8, 24), (40, 56)   red
+ *
+ * One sample per pixel, or a target read as if it had one, gives no half
+ * columns. KoreGP reads the target back with a shader that averages the
+ * samples (tri_resolve.comp); the Vulkan twin uses a resolve attachment.
+ */
+#define TRI_MSAA_SAMPLES 4u
+#define TRI_MSAA_SHIFT (1.0f / 64.0f)
+
+/* tri_resolve.comp's root struct */
+struct tri_resolve_root {
+   uint64_t dst;
+   uint32_t width;
+   uint32_t samples;
+   uint32_t pad[12];
+};
+
+static inline int
+tri_check_msaa(const char *what, const uint32_t *got)
+{
+   for (uint32_t y = 0; y < TRI_H; y++) {
+      for (uint32_t x = 0; x < TRI_W; x++) {
+         const int in_y = y >= 16 && y < 48;
+         const int edge = x == 8 || x == 24 || x == 40 || x == 56;
+         const int inside = (x > 8 && x < 24) || (x > 40 && x < 56);
+         const uint32_t px = got[y * TRI_W + x];
+         const int ok = !in_y || !(edge || inside) ? px == 0xff000000u :
+                        inside ? px == 0xff0000ffu :
+                        px == 0xff00007fu || px == 0xff000080u;
+         if (!ok) {
+            fprintf(stderr, "%s: pixel (%u, %u) = %08x, expected %s\n",
+                    what, x, y, px,
+                    !in_y || !(edge || inside) ? "ff000000" :
+                    inside ? "ff0000ff" : "ff00007f or ff000080");
+            return 1;
+         }
+      }
+   }
+   return 0;
+}
+
 /* The mrt variant's second target. */
 static inline int
 tri_check_mrt1(const char *what, const uint32_t *got)

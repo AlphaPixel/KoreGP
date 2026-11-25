@@ -11,7 +11,9 @@
 #include "saxpy_spv.h"
 #include "scratch_oracle.h"
 #include "scratch_spv.h"
+#include "tri_mesh_ps_spv.h"
 #include "tri_mrt_ps_spv.h"
+#include "tri_ms_spv.h"
 #include "tri_ps_spv.h"
 #include "tri_scene.h"
 #include "tri_vs_spv.h"
@@ -462,8 +464,10 @@ shader_module(struct vkc *c, const uint32_t *spirv, size_t size)
  */
 static int
 run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
-             uint32_t bench_cbs, uint32_t bench_draws)
+             uint32_t bench_cbs, uint32_t bench_draws, int mesh, bool msaa)
 {
+   /* msaa: four samples, resolved into the second image (tri_scene.h) */
+   /* mesh: 1 = kgpDrawMeshlets, 2 = kgpDrawMeshletsIndirect */
    static const VkFormat target_formats[TRI_TARGET_COUNT] = {
       [TRI_TARGET_RGBA8] = VK_FORMAT_R8G8B8A8_UNORM,
       [TRI_TARGET_SRGB8] = VK_FORMAT_R8G8B8A8_SRGB,
@@ -487,6 +491,10 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
    *(VkDrawIndexedIndirectCommand *)ab.map = (VkDrawIndexedIndirectCommand) {
       .indexCount = TRI_INDEX_COUNT, .instanceCount = TRI_INSTANCE_COUNT,
    };
+   if (mesh) {
+      *(VkDrawMeshTasksIndirectCommandEXT *)ab.map =
+         (VkDrawMeshTasksIndirectCommandEXT) { TRI_INSTANCE_COUNT, 1, 1 };
+   }
    struct vkc_buffer vb =
       vkc_buffer_create(c, TRI_VERTEX_COUNT * sizeof(struct tri_vertex));
    struct vkc_buffer ib =
@@ -497,6 +505,8 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       vkc_buffer_create(c, TRI_DEPTH_DRAWS * sizeof(struct tri_ps_root));
    struct vkc_buffer ob = vkc_buffer_create(c, TRI_W * TRI_H * bpp);
    tri_fill(vb.map, ib.map);
+   for (unsigned i = 0; msaa && i < TRI_VERTEX_COUNT; i++)
+      ((struct tri_vertex *)vb.map)[i].pos[0] += TRI_MSAA_SHIFT;
    *(struct tri_vs_root *)vrb.map = (struct tri_vs_root) {
       .vertices = vb.addr, .instance_step = TRI_INSTANCE_STEP,
    };
@@ -584,7 +594,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       .extent = { TRI_W, TRI_H, 1 },
       .mipLevels = 1,
       .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .samples = msaa ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT,
       .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -612,13 +622,15 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
       .subresourceRange = range,
    }, NULL, &view));
 
-   /* The mrt variant's second target: the same again. */
+   /* The mrt variant's second target: the same again. Also what the msaa
+    * variant resolves into.
+    */
    VkImage image1 = VK_NULL_HANDLE;
    VkDeviceMemory image1_mem = VK_NULL_HANDLE;
    VkImageView view1 = VK_NULL_HANDLE;
    struct vkc_buffer ob1 = vkc_buffer_create(c, TRI_W * TRI_H * 4);
    memset(ob1.map, 0, TRI_W * TRI_H * 4);
-   if (mrt) {
+   if (mrt || msaa) {
       VK_OK(vkCreateImage(c->dev, &(VkImageCreateInfo) {
          .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
          .imageType = VK_IMAGE_TYPE_2D,
@@ -648,25 +660,33 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
    const uint32_t color_count = mrt ? 2 : 1;
    const VkFormat formats[2] = { format, format };
 
+   const VkShaderStageFlags root_stages =
+      (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
+      VK_SHADER_STAGE_FRAGMENT_BIT;
    VkPipelineLayout layout;
    VK_OK(vkCreatePipelineLayout(c->dev, &(VkPipelineLayoutCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
       .pushConstantRangeCount = 1,
       .pPushConstantRanges = &(VkPushConstantRange) {
-         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                       VK_SHADER_STAGE_FRAGMENT_BIT,
+         .stageFlags = root_stages,
          .size = 2 * sizeof(VkDeviceAddress),
       },
    }, NULL, &layout));
 
-   VkShaderModule vs = shader_module(c, tri_vs_spv, sizeof(tri_vs_spv));
-   VkShaderModule ps = mrt
+   VkShaderModule vs = mesh
+      ? shader_module(c, tri_ms_spv, sizeof(tri_ms_spv))
+      : shader_module(c, tri_vs_spv, sizeof(tri_vs_spv));
+   VkShaderModule ps = mesh
+      ? shader_module(c, tri_mesh_ps_spv, sizeof(tri_mesh_ps_spv))
+      : mrt
       ? shader_module(c, tri_mrt_ps_spv, sizeof(tri_mrt_ps_spv))
       : shader_module(c, tri_ps_spv, sizeof(tri_ps_spv));
    const VkPipelineShaderStageCreateInfo stages[2] = {
       {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main",
+         .stage = mesh ? VK_SHADER_STAGE_MESH_BIT_EXT
+                       : VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vs, .pName = "main",
       },
       {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -732,7 +752,8 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
          },
          .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+            .rasterizationSamples = msaa ? VK_SAMPLE_COUNT_4_BIT
+                                         : VK_SAMPLE_COUNT_1_BIT,
          },
          .pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -824,8 +845,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
                vrb.addr + r * sizeof(struct tri_vs_root),
                prb.addr + r * sizeof(struct tri_ps_root),
             };
-            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT |
-                               VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+            vkCmdPushConstants(cmd, layout, root_stages, 0,
                                sizeof(draw_roots), draw_roots);
             vkCmdDrawIndexed(cmd, TRI_INDEX_COUNT, TRI_INSTANCE_COUNT, 0, 0, 0);
          }
@@ -851,7 +871,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                         0, NULL, 0, NULL, 1, &to_target);
-   if (mrt) {
+   if (mrt || msaa) {
       VkImageMemoryBarrier to_target1 = to_target;
       to_target1.image = image1;
       vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -879,6 +899,10 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = msaa ? VK_RESOLVE_MODE_AVERAGE_BIT
+                                : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = msaa ? view1 : VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue.color.float32 = TRI_CLEAR_RGBA,
@@ -914,10 +938,22 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
     * up to it compares.)
     */
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[0]);
-   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT |
-                      VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(roots), roots);
-   vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
-   if (depth) {
+   vkCmdPushConstants(cmd, layout, root_stages, 0, sizeof(roots), roots);
+   if (!mesh)
+      vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+   /* Extension commands: the loader does not export them. */
+   if (mesh == 2) {
+      PFN_vkCmdDrawMeshTasksIndirectEXT draw_indirect =
+         (PFN_vkCmdDrawMeshTasksIndirectEXT)
+         vkGetDeviceProcAddr(c->dev, "vkCmdDrawMeshTasksIndirectEXT");
+      draw_indirect(cmd, ab.buffer, 0, 1,
+                    sizeof(VkDrawMeshTasksIndirectCommandEXT));
+   } else if (mesh) {
+      PFN_vkCmdDrawMeshTasksEXT draw =
+         (PFN_vkCmdDrawMeshTasksEXT)
+         vkGetDeviceProcAddr(c->dev, "vkCmdDrawMeshTasksEXT");
+      draw(cmd, TRI_INSTANCE_COUNT, 1, 1);
+   } else if (depth) {
       vkCmdDrawIndexed(cmd, TRI_INDEX_COUNT, TRI_INSTANCE_COUNT, 0, 0, 0);
       for (unsigned d = 1; d < draws; d++) {
          const VkDeviceAddress draw_roots[2] = {
@@ -925,8 +961,7 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
             prb.addr + d * sizeof(struct tri_ps_root),
          };
          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[d]);
-         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT |
-                            VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+         vkCmdPushConstants(cmd, layout, root_stages, 0,
                             sizeof(draw_roots), draw_roots);
          vkCmdDrawIndexed(cmd, TRI_INDEX_COUNT, TRI_INSTANCE_COUNT, 0, 0, 0);
       }
@@ -947,10 +982,13 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
    to_source.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
    to_source.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
    to_source.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   if (msaa)
+      to_source.image = image1;
    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                         0, NULL, 0, NULL, 1, &to_source);
-   vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+   vkCmdCopyImageToBuffer(cmd, msaa ? image1 : image,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                           ob.buffer, 1,
                           &(VkBufferImageCopy) {
                              .imageSubresource = {
@@ -981,7 +1019,8 @@ run_triangle(struct vkc *c, bool indirect, int scene, int tfmt,
    if (kgp_test_offline()) {
       printf("vk triangle: recorded and submitted (offline)\n");
    } else {
-      ret = tfmt != TRI_TARGET_RGBA8
+      ret = msaa ? tri_check_msaa("vk triangle", ob.map) :
+            tfmt != TRI_TARGET_RGBA8
          ? tri_check_target("vk triangle", ob.map, tfmt)
          : tri_check("vk triangle", ob.map, TRI_W, scene);
       if (ret == 0 && mrt)
@@ -1021,7 +1060,8 @@ main(int argc, char **argv)
    if (argc < 2) {
       fprintf(stderr, "usage: %s saxpy|prefix_sum|scratch|indirect|"
               "copy [linear|mip|layer|3d]|"
-              "triangle [indirect|depth|stencil|state|mrt|<format>|"
+              "triangle [indirect|depth|stencil|state|mrt|mesh|"
+              "meshindirect|msaa|<format>|"
               "bench [command buffers] [draws]]\n", argv[0]);
       return 2;
    }
@@ -1045,7 +1085,8 @@ main(int argc, char **argv)
             strcmp(argv[2], "bench") == 0)
       ret = run_triangle(&c, false, TRI_SCENE_PLAIN, TRI_TARGET_RGBA8,
                          argc > 3 ? strtoul(argv[3], NULL, 0) : 1000,
-                         argc > 4 ? strtoul(argv[4], NULL, 0) : 100);
+                         argc > 4 ? strtoul(argv[4], NULL, 0) : 100, 0,
+                         false);
    else if (strcmp(argv[1], "triangle") == 0)
       ret = run_triangle(&c, argc > 2 && strcmp(argv[2], "indirect") == 0,
                          argc > 2 && strcmp(argv[2], "depth") == 0
@@ -1057,7 +1098,11 @@ main(int argc, char **argv)
                          argc > 2 && strcmp(argv[2], "mrt") == 0
                             ? TRI_SCENE_MRT : TRI_SCENE_PLAIN,
                          tri_target_from_arg(argc > 2 ? argv[2] : NULL),
-                         0, 0);
+                         0, 0,
+                         argc > 2 && strcmp(argv[2], "mesh") == 0 ? 1 :
+                         argc > 2 && strcmp(argv[2], "meshindirect") == 0
+                            ? 2 : 0,
+                         argc > 2 && strcmp(argv[2], "msaa") == 0);
 
    vkc_finish(&c);
    return ret;

@@ -19,13 +19,15 @@ Milestones here are named so they cannot be confused with the proposal's:
 
 ## State on 2026-11-24
 
-On hardware, twelve windows (`results-n1.md`). The twelfth (2026-11-24
+On hardware, thirteen windows (`results-n1.md`). The thirteenth
+(2026-11-24 23:56) passed every step, among them mesh shaders, MSAA and
+split barriers for the first time; nothing in the tree is now unverified
+on the GPU. The twelfth (2026-11-24
 18:06, commit `26f0c8d`) passed every step, among them everything added
 since the eleventh: raster state, two colour targets, the other target
 formats, sub-resource copies, the compute-written multi-draw, the
 shader-side heap bounds check, and the draw benchmark (65 - 73 ns a draw
-against NVK's 103 - 106). Nothing in the tree is now unverified on the
-GPU. The eleventh (2026-11-23
+against NVK's 103 - 106). The eleventh (2026-11-23
 19:17) presented 120 frames on the monitor through `kgp_present display`,
 which completes R10 as far as a test can check it. The seventh (2026-11-23
 11:46) ran specialization constants and presentation to a headless
@@ -82,6 +84,44 @@ Next, in dependency order:
   false alarm). `kgp_validate` passed on the GPU in the ninth window.
   The NIR-injected bounds checks on heap indexing were added after it
   (2026-11-24) and are correct on the GPU (twelfth window).
+
+Added after the twelfth window (2026-11-24; 81 offline tests pass, also
+under `KGP_DEBUG=1`, and the new ones are clean under the sanitizers).
+All of it ran on the GPU in the thirteenth window and is correct; the
+risks named below are what was expected before it:
+
+- **Mesh shaders** (proposal M3). `kgpCreateMeshPipeline`,
+  `kgpDrawMeshlets`, `kgpDrawMeshletsIndirect`; no task shader. Extracted
+  from NVK like the rest: its NIR pass and its two draw macros are called,
+  not copied, and a mesh shader without a task shader sits in the vertex
+  shader's slot, so the root convention is unchanged. `kgp_triangle mesh`
+  and `meshindirect` draw the plain scene from a mesh shader with a
+  per-primitive output (which needs a second program header, for the
+  geometry stage); both have Vulkan twins, and the stream from render pass
+  to draw is NVK's (324 and 326 methods). Risk on hardware: medium. The
+  comparison says the commands are NVK's; that the shader NAK produced
+  under KoreGP's lowering runs is what the window checks.
+- **MSAA.** `KgpTextureDesc::sampleCount` and `KgpRasterDesc::sampleCount`
+  (2, 4 or 8) and `alphaToCoverage`, with Vulkan's standard sample
+  locations. A multisampled texture is mapped under its PTE kind, as
+  D24S8 is, without asking whether it would work at an ordinary address.
+  There is no resolve call: a shader reads the samples through the heap
+  (`sampler2DMS`), which is how `kgp_triangle msaa` reads its target back
+  (`tri_resolve.comp`). The twin resolves with a Vulkan resolve
+  attachment; 325 methods identical. Risk on hardware: medium, in the
+  texel fetch of a multisampled heap entry more than in the rendering.
+- **Split barriers** (proposal M3). `kgpSignalAfter` and `kgpWaitBefore`
+  on a 64-bit value in GPU memory, as the channel's semaphore methods
+  (`nvk-mapping.md`, §5.5). `kgpBarrier` is now the two halves they share,
+  and pushes what it did. `kgp_split` signals, waits on a signalled
+  value, and has the CPU release a waiting command buffer. No twin: NVK
+  does not use these methods. Risk on hardware: high for the test, low
+  for the host. Nothing here says how nouveau's channel behaves while a
+  wait is unsatisfied; a wait that is never satisfied should end with
+  the kernel timing the job out, and the step runs last of the
+  correctness steps for that reason.
+- The draw benchmark also runs 500 command buffers of 1000 draws in the
+  suite, the shape of the offline table.
 
 Added on 2026-11-24 (all run on the GPU in the twelfth window):
 
@@ -462,8 +502,8 @@ default. libkoregp.so now links most of NVK (the macro builders live in
 
 ## Deferred
 
-- Mesh shaders, multi-draw-indirect, split barriers, validation layer beyond
-  basic argument checks, SDK packaging (proposal M3).
+- Task shaders (mesh shaders are in, without them), SDK packaging
+  (proposal M3).
 - AMD/RADV backend (the proposal's reference target; needs AMD hardware).
 - The layered Vulkan ICD, ICD loader, CMake config, vcpkg port (§9). The
   shared SPIR-V root ABI (D5) is chosen so this stays possible: the test

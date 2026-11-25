@@ -17,11 +17,14 @@ trap 'rm -rf "$tmp"' EXIT
 
 ind=0
 [ "${4:-}" = indirect ] && ind=1
+mesh=0
+[ "${4:-}" = mesh ] && mesh=1
+[ "${4:-}" = meshindirect ] && mesh=2
 
 NVK_DEBUG=push_dump "$3" triangle ${4:+"$4"} 2>&1 >/dev/null |
-   awk -v indirect=$ind -f "$1" > "$tmp/nvk"
+   awk -v indirect=$ind -v mesh=$mesh -f "$1" > "$tmp/nvk"
 KGP_DEBUG=push "$2" ${4:+"$4"} 2>&1 >/dev/null |
-   awk -v indirect=$ind -f "$1" > "$tmp/koregp"
+   awk -v indirect=$ind -v mesh=$mesh -f "$1" > "$tmp/koregp"
 
 diff -u "$tmp/nvk" "$tmp/koregp"
 echo "triangle${4:+ $4}: $(wc -l < "$tmp/koregp") 3D methods from render pass to draw, identical to NVK"

@@ -80,6 +80,16 @@ kgp_texture_layout(struct KgpDevice_T *dev, const KgpTextureDesc *desc,
       kgp_err("texture: KGP_TEXTURE_LINEAR is 2D, one level, no layers");
       return false;
    }
+   const uint32_t samples = MAX2(desc->sampleCount, 1);
+   if (samples != 1 && samples != 2 && samples != 4 && samples != 8) {
+      kgp_err("texture: sampleCount must be 0, 1, 2, 4 or 8");
+      return false;
+   }
+   if (samples > 1 && (linear || depth > 1 || layers > 1 || levels > 1)) {
+      kgp_err("texture: a multisampled texture is tiled, 2D, one level, "
+              "no layers");
+      return false;
+   }
    if (desc->flags & ~KGP_TEXTURE_LINEAR) {
       kgp_err("texture: unknown flags 0x%x", desc->flags);
       return false;
@@ -95,7 +105,7 @@ kgp_texture_layout(struct KgpDevice_T *dev, const KgpTextureDesc *desc,
          .array_len = layers,
       },
       .levels = levels,
-      .samples = 1,
+      .samples = samples,
       .usage = NIL_IMAGE_USAGE_UNCOMPRESSED_BIT |
                (linear ? NIL_IMAGE_USAGE_LINEAR_BIT : 0),
       /* Not 0: that is DRM_FORMAT_MOD_LINEAR and selects the linear layout */
@@ -214,12 +224,16 @@ kgpCreateTexture(KgpDevice dev, const KgpTextureDesc *desc, void *gpuPtr)
     * ponytail: KGP_MEMORY_GPU only, and the texture must start on a page
     * of its allocation; mapped memory when someone needs to write stencil
     * from the CPU.
+    *
+    * Multisampled textures take the same path without having been
+    * measured at an ordinary address: it is what NVK does for them.
     */
-   if (tex->format == KGP_FORMAT_D24_UNORM_S8_UINT) {
+   if (tex->format == KGP_FORMAT_D24_UNORM_S8_UINT ||
+       tex->image.sample_layout != NIL_SAMPLE_LAYOUT_1X1) {
       uint64_t offset_B = 0;
       struct nvkmd_mem *mem = kgp_gpu_only_mem(dev, tex->addr, &offset_B);
       if (!kgp_texture_map_kind(dev, tex, mem, offset_B)) {
-         kgp_err("kgpCreateTexture: a depth-stencil texture must lie in "
+         kgp_err("kgpCreateTexture: a depth-stencil or multisampled texture must lie in "
                  "KGP_MEMORY_GPU memory, page-aligned within its allocation "
                  "(%p)", gpuPtr);
          free(tex);

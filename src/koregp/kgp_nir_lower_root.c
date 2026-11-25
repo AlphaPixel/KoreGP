@@ -94,6 +94,13 @@ lower_root_intrin(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       break;
 
    case nir_intrinsic_load_num_workgroups:
+      if (!compute) {
+         /* A mesh shader's: draw.mesh.group_count, which NVK's mesh draw
+          * macros write.
+          */
+         val = load_draw_param(b, intrin, 8);
+         break;
+      }
       val = nir_ldc_nv(b, 3, 32,
                        nir_imm_int(b, KGP_CBUF_ROOT), nir_imm_int(b, 0),
                        .base = offsetof(struct kgp_root_record, group_count),

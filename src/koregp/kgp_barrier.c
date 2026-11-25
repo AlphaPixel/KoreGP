@@ -30,31 +30,17 @@
 #include "nv_push_clb1c0.h"
 #include "nv_push_clc597.h"
 
+#include "clc36f.h"
+
 #define KGP_RASTER_SHADER_STAGES \
    (KGP_STAGE_VERTEX_SHADER | KGP_STAGE_PIXEL_SHADER)
 #define KGP_RASTER_OUT_STAGES \
    (KGP_STAGE_RASTER_COLOR_OUT | KGP_STAGE_RASTER_DEPTH_OUT)
 
-KGP_API void
-kgpBarrier(KgpCommandBuffer cb, KGP_STAGE src, KGP_STAGE dst,
-           KGP_HAZARD hazards)
+/* Producer: finish, and get what it wrote out of the write-back caches. */
+static void
+kgp_barrier_producer(struct nv_push *p, KGP_STAGE src)
 {
-   if (unlikely(cb->validate) &&
-       !kgp_cb_validate_barrier(cb, src, dst, hazards))
-      return;
-
-   /* Which engine the consumer is: compute, the 3D engine's shaders, both.
-    * The copy engine as a consumer needs nothing (see the header comment).
-    */
-   const bool dst_gfx = dst & KGP_RASTER_SHADER_STAGES;
-   const bool dst_cs = dst & KGP_STAGE_COMPUTE;
-   const bool reads_args = hazards & KGP_HAZARD_DRAW_ARGUMENTS;
-   /* Arguments of an indirect dispatch, or of nothing in particular. */
-   const bool reads_args_cs = reads_args && (dst_cs || !dst_gfx);
-
-   struct nv_push *p = kgp_cb_push(cb, 40);
-
-   /* Producer: finish, and get what it wrote out of the write-back caches. */
    if (src & KGP_STAGE_TRANSFER) {
       /* NVK_BARRIER_WFI as NVK spells it on the copy subchannel: an empty
        * transfer that is not pipelined, so it waits for those before it.
@@ -97,6 +83,19 @@ kgpBarrier(KgpCommandBuffer cb, KGP_STAGE src, KGP_STAGE dst,
       /* NVK_BARRIER_WFI */
       P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
    }
+}
+
+static void
+kgp_barrier_consumer(struct nv_push *p, KGP_STAGE dst, KGP_HAZARD hazards)
+{
+   /* Which engine the consumer is: compute, the 3D engine's shaders, both.
+    * The copy engine as a consumer needs nothing (see the header comment).
+    */
+   const bool dst_gfx = dst & KGP_RASTER_SHADER_STAGES;
+   const bool dst_cs = dst & KGP_STAGE_COMPUTE;
+   const bool reads_args = hazards & KGP_HAZARD_DRAW_ARGUMENTS;
+   /* Arguments of an indirect dispatch, or of nothing in particular. */
+   const bool reads_args_cs = reads_args && (dst_cs || !dst_gfx);
 
    /* Consumer: drop what it may have cached of the producer's targets. */
    if (dst_cs) {
@@ -170,4 +169,109 @@ kgpBarrier(KgpCommandBuffer cb, KGP_STAGE src, KGP_STAGE dst,
    }
 
    /* KGP_HAZARD_DEPTH_STENCIL: nothing until there are depth targets. */
+}
+
+#define KGP_BARRIER_PUSH_DW 40
+
+KGP_API void
+kgpBarrier(KgpCommandBuffer cb, KGP_STAGE src, KGP_STAGE dst,
+           KGP_HAZARD hazards)
+{
+   if (unlikely(cb->validate) &&
+       !kgp_cb_validate_barrier(cb, src, dst, hazards))
+      return;
+
+   struct nv_push *p = kgp_cb_push(cb, KGP_BARRIER_PUSH_DW);
+   kgp_barrier_producer(p, src);
+   kgp_barrier_consumer(p, dst, hazards);
+}
+
+/* Split barriers ------------------------------------------------------------
+ *
+ * No ancestor: NVK does not use the channel's semaphore methods. They are
+ * host methods (class C36F), valid on any subchannel: an address, a
+ * payload and an operation. RELEASE with RELEASE_WFI stores the payload
+ * once the engines are idle; ACQUIRE holds the channel until the memory
+ * matches, yielding its timeslice meanwhile (ACQUIRE_SWITCH_TSG).
+ */
+/* NVC36F_SEM_EXECUTE's fields (clc36f.h gives them as bit ranges). */
+#define KGP_SEM_OP(x) (NVC36F_SEM_EXECUTE_OPERATION_##x << 0)
+#define KGP_SEM_SWITCH_TSG (1u << 12)
+#define KGP_SEM_RELEASE_WFI (1u << 20)
+#define KGP_SEM_PAYLOAD_64 (1u << 24)
+#define KGP_SEM_REDUCTION(x) (NVC36F_SEM_EXECUTE_REDUCTION_##x << 27)
+#define KGP_SEM_UNSIGNED (1u << 31)
+
+static bool
+kgp_sem_check(struct KgpCommandBuffer_T *cb, const char *fn, void *valueGpu)
+{
+   const uint64_t addr = (uintptr_t)valueGpu;
+   if (unlikely(addr == 0 || addr % 8 != 0 || addr >> 40 != 0)) {
+      kgp_err("%s: valueGpu must be an 8-byte aligned GPU pointer below 2^40",
+              fn);
+      cb->failed = true;
+      return false;
+   }
+   return kgp_check_ptr(cb, fn, valueGpu, 8, 8);
+}
+
+static void
+kgp_push_sem(struct nv_push *p, uint64_t addr, uint64_t value, uint32_t execute)
+{
+   __push_mthd(p, SUBC_NV90C0, NVC36F_SEM_ADDR_LO);
+   P_INLINE_DATA(p, (uint32_t)addr);          /* OFFSET is bits 31:2 */
+   P_INLINE_DATA(p, (uint32_t)(addr >> 32));
+   P_INLINE_DATA(p, (uint32_t)value);
+   P_INLINE_DATA(p, (uint32_t)(value >> 32));
+   P_INLINE_DATA(p, execute);
+}
+
+KGP_API void
+kgpSignalAfter(KgpCommandBuffer cb, KGP_STAGE src, void *valueGpu,
+               uint64_t value, KGP_SIGNAL op)
+{
+   if (unlikely(op > KGP_SIGNAL_MAX)) {
+      kgp_err("kgpSignalAfter: unknown KGP_SIGNAL");
+      cb->failed = true;
+      return;
+   }
+   if (!kgp_sem_check(cb, "kgpSignalAfter", valueGpu))
+      return;
+
+   struct nv_push *p = kgp_cb_push(cb, KGP_BARRIER_PUSH_DW + 6);
+   kgp_barrier_producer(p, src);
+
+   uint32_t execute =
+      KGP_SEM_RELEASE_WFI |
+      KGP_SEM_PAYLOAD_64;
+   if (op == KGP_SIGNAL_MAX) {
+      execute |= KGP_SEM_OP(REDUCTION) |
+                 KGP_SEM_REDUCTION(IMAX) |
+                 KGP_SEM_UNSIGNED;
+   } else {
+      execute |= KGP_SEM_OP(RELEASE);
+   }
+   kgp_push_sem(p, (uintptr_t)valueGpu, value, execute);
+}
+
+KGP_API void
+kgpWaitBefore(KgpCommandBuffer cb, KGP_STAGE dst, void *valueGpu,
+              uint64_t value, KGP_WAIT op, KGP_HAZARD hazards)
+{
+   if (unlikely(op > KGP_WAIT_GREATER_EQUAL)) {
+      kgp_err("kgpWaitBefore: unknown KGP_WAIT");
+      cb->failed = true;
+      return;
+   }
+   if (!kgp_sem_check(cb, "kgpWaitBefore", valueGpu))
+      return;
+
+   struct nv_push *p = kgp_cb_push(cb, KGP_BARRIER_PUSH_DW + 6);
+   kgp_push_sem(p, (uintptr_t)valueGpu, value,
+                (op == KGP_WAIT_EQUAL
+                    ? KGP_SEM_OP(ACQUIRE)
+                    : KGP_SEM_OP(ACQ_STRICT_GEQ)) |
+                KGP_SEM_SWITCH_TSG |
+                KGP_SEM_PAYLOAD_64);
+   kgp_barrier_consumer(p, dst, hazards);
 }

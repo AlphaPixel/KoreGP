@@ -240,6 +240,9 @@ run on hardware.
 | `kgp_triangle srgb`, `rgba16f`, `rgba32f`, `r32f`, their `vk_triangle_*` twins and `triangle_matches_nvk_*` | added 2026-11-24, offline only so far. The plain triangle scene into a render target of each format, read back at its own texel size; from the render pass to the draw KoreGP's methods are NVK's, the target format among them |
 | `kgp_triangle mrt`, `vk_triangle_mrt`, `triangle_matches_nvk_mrt` | added 2026-11-24, offline only so far, and the first test to draw into more than one colour target. Two targets, a pixel shader with two outputs, the second target through a per-target write mask (`KgpRasterDesc::colorWrite`); KoreGP's methods are NVK's, the six unused target slots, the target selection and the combined mask among them |
 | `kgp_triangle multigpu` | added 2026-11-24, offline only so far. A compute shader turns four candidate draws into the three records, the count and the per-draw root structs of a multi-draw later in the same command buffer; recorded and submitted. No twin: Vulkan has no spelling for per-draw root data |
+| `kgp_triangle mesh`, `meshindirect`, their `vk_triangle_*` twins and `triangle_matches_nvk_*` | added after the twelfth window, correct on the GPU in the thirteenth. The plain scene from a mesh shader, one workgroup per quad, with a per-primitive output; direct and with the group counts read by the GPU. 324 and 326 methods from render pass to draw, identical to NVK's, the mesh shader's block and its geometry-stage header included |
+| `kgp_triangle msaa`, `vk_triangle_msaa`, `triangle_matches_nvk_msaa` | added after the twelfth window, correct on the GPU in the thirteenth. Four samples, the quads' edges through the middle of a pixel column, read back by a shader that averages the samples through the heap. 325 methods identical to NVK's, sample layout and locations included |
+| `kgp_split` | added after the twelfth window, correct on the GPU in the thirteenth (offline it records and submits). `kgpSignalAfter` (SET, MAX), `kgpWaitBefore` on a value signalled earlier, and a command buffer the CPU releases by writing the value. No twin |
 
 Every dispatch in the suite also checks, by assertion, that the QMD built
 from the pipeline's template is byte-identical to the one NAK builds.
@@ -629,6 +632,47 @@ submits, which is the claim.
 
 `bench_gpu`: the first run after the swap is again the slow one (saxpy
 over 16M elements 0.790 ms first, 0.599 ms when repeated last).
+
+## Thirteenth window (2026-11-24 23:56): mesh shaders, MSAA, split barriers
+
+The tree was commit `7951ec0` plus the three features, not yet committed
+when the window ran. Every step passed, and the host was restored cleanly.
+First time on the GPU, all correct:
+
+- `kgp_triangle mesh` and `meshindirect`, with their Vulkan twins: the
+  mesh shader NAK produces under KoreGP's lowering runs, per-primitive
+  output and GPU-read group counts included;
+- `kgp_triangle msaa`: four samples rendered, and read back by a compute
+  shader fetching each sample through the heap, so a multisampled texture
+  works as a heap entry;
+- `kgp_split`: signals (set and maximum) store what they should, a wait
+  on a value signalled earlier passes, and a command buffer that starts
+  with a wait on an unwritten value did not run for the 200 ms the test
+  gives it, then ran when the CPU wrote the value. nouveau's channel
+  holding an unsatisfied acquire that long did no harm; nothing longer
+  was tried.
+
+Draw cost, release build, three runs of 2000 command buffers of 100 draws
+alternating the two APIs, then one of 500 x 1000:
+
+| | Record, ns per draw | Submit, us per command buffer |
+|---|---|---|
+| KoreGP, 2000 x 100 | 58.2 - 64.9 | 6.4 - 8.3 |
+| NVK through Vulkan, 2000 x 100 | 99.3 - 110.1 | 8.5 - 8.8 |
+| KoreGP, 500 x 1000 | 26.6 | 7.6 |
+| NVK through Vulkan, 500 x 1000 | 63.0 | 8.6 |
+
+The 500 x 1000 shape is the per-draw cost nearly on its own: 2.4 times
+less CPU per draw on the card (one run).
+
+Dispatch cost: KoreGP 129.2, 130.4, 135.5 and 61.3 ns (the last at 200 x
+1000) against NVK's 816.6, 485.3, 816.7 and 430.4 ns.
+
+`strace`: 12 `VM_BIND` with 8 command buffers and 12 with 800 (27 and 819
+`EXEC`), as in the twelfth window.
+
+`bench_gpu`: the first run after the swap was much slower this time (saxpy
+over 16M elements 5.038 ms first, 0.633 ms when repeated last).
 
 ## Memory safety
 

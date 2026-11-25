@@ -525,9 +525,20 @@ kgp_push_draw_state_init(const struct nv_device_info *info, struct nv_push *p,
 static uint32_t
 kgp_shader_type(mesa_shader_stage stage)
 {
-   assert(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT);
-   return stage == MESA_SHADER_VERTEX ? NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX
-                                      : NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL;
+   /* A mesh shader without a task shader takes the vertex shader's place
+    * (ancestor: mesa_to_nv9097_shader_type).
+    */
+   assert(stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_MESH ||
+          stage == MESA_SHADER_FRAGMENT);
+   return stage == MESA_SHADER_FRAGMENT ? NV9097_SET_PIPELINE_SHADER_TYPE_PIXEL
+                                        : NV9097_SET_PIPELINE_SHADER_TYPE_VERTEX;
+}
+
+/* Ancestors: nvk_pipeline_bind_group, nvk_cbuf_binding_for_stage. */
+static uint32_t
+kgp_bind_group(mesa_shader_stage stage)
+{
+   return stage == MESA_SHADER_MESH ? MESA_SHADER_VERTEX : stage;
 }
 
 /* Ancestor: nvk_shader_fill_push up to "Stash this", vertex and pixel
@@ -563,11 +574,45 @@ kgp_shader_fill_push(const struct nv_device_info *info, struct nv_push *p,
    /* The binding group is the stage, as for constant buffers. */
    P_MTHD(p, NVC397, SET_PIPELINE_REGISTER_COUNT(idx));
    P_NVC397_SET_PIPELINE_REGISTER_COUNT(p, idx, sh->num_gprs);
-   P_NVC397_SET_PIPELINE_BINDING(p, idx, sh->stage);
+   P_NVC397_SET_PIPELINE_BINDING(p, idx, kgp_bind_group(sh->stage));
 
-   if (sh->stage == MESA_SHADER_VERTEX) {
-      P_IMMD(p, NVC597, SET_MESH_CONTROL, false);
-   } else {
+   if (sh->stage != MESA_SHADER_FRAGMENT) {
+      P_IMMD(p, NVC597, SET_MESH_CONTROL, sh->stage == MESA_SHADER_MESH);
+   }
+
+   if (sh->stage == MESA_SHADER_MESH) {
+      assert(sh->mesh.max_vertices != 0 && sh->mesh.max_primitives != 0);
+
+      /* The shadow-RAM mode around the two methods is a workaround NVK
+       * takes from the proprietary driver; see the ancestor.
+       */
+      P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK);
+      P_MTHD(p, NVC597, SET_MESH_SHADER_A);
+      P_NVC597_SET_MESH_SHADER_A(p, {
+         .output_topology = sh->mesh.topology,
+         .max_vertex = sh->mesh.max_vertices,
+         .max_primitive = sh->mesh.max_primitives,
+      });
+      P_NVC597_SET_MESH_SHADER_B(p, {
+         .shared_mem_lines = DIV_ROUND_UP(sh->mesh.smem_size, 128),
+         .thread_count = sh->mesh.local_size,
+      });
+      P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL,
+             MODE_METHOD_TRACK_WITH_FILTER);
+
+      if (sh->mesh.has_gs_sph) {
+         const uint32_t gs = NV9097_SET_PIPELINE_SHADER_TYPE_GEOMETRY;
+         P_IMMD(p, NV9097, SET_PIPELINE_SHADER(gs), {
+            .enable  = true,
+            .type    = TYPE_GEOMETRY,
+         });
+         P_MTHD(p, NVC397, SET_PIPELINE_PROGRAM_ADDRESS_A(gs));
+         P_NVC397_SET_PIPELINE_PROGRAM_ADDRESS_A(p, gs,
+                                                 shader->gs_hdr_addr >> 32);
+         P_NVC397_SET_PIPELINE_PROGRAM_ADDRESS_B(p, gs, shader->gs_hdr_addr);
+         P_IMMD(p, NVC397, SET_GS_MODE, TYPE_ANY);
+      }
+   } else if (sh->stage == MESA_SHADER_FRAGMENT) {
       P_MTHD(p, NVC397, SET_SUBTILING_PERF_KNOB_A);
       P_NV9097_SET_SUBTILING_PERF_KNOB_A(p, {
          .fraction_of_spm_register_file_per_subtile         = 0x10,
@@ -698,6 +743,10 @@ kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
          kgp_shader_fill_push(info, p, vs);
       } else if (type == kgp_shader_type(MESA_SHADER_FRAGMENT)) {
          kgp_shader_fill_push(info, p, ps);
+      } else if (type == NV9097_SET_PIPELINE_SHADER_TYPE_GEOMETRY &&
+                 vs->info->stage == MESA_SHADER_MESH &&
+                 vs->info->mesh.has_gs_sph) {
+         /* The mesh shader's block has bound its geometry header there. */
       } else {
          P_IMMD(p, NV9097, SET_PIPELINE_SHADER(type), {
             .enable  = ENABLE_FALSE,
@@ -721,7 +770,8 @@ kgp_gfx_pipeline_build_push(const struct nv_device_info *info,
       P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_B(p, shader->data_addr >> 32);
       P_NV9097_SET_CONSTANT_BUFFER_SELECTOR_C(p, shader->data_addr);
 
-      P_IMMD(p, NV9097, BIND_GROUP_CONSTANT_BUFFER(shader->info->stage), {
+      P_IMMD(p, NV9097,
+             BIND_GROUP_CONSTANT_BUFFER(kgp_bind_group(shader->info->stage)), {
          .valid = VALID_TRUE,
          .shader_slot = KGP_CBUF_SHADER_DATA,
       });
@@ -768,7 +818,63 @@ kgp_cb_begin_graphics(struct KgpCommandBuffer_T *cb)
    });
 }
 
-/* Ancestors: nvk_CmdBeginRendering (one sample, no stencil, no ZCULL, no
+/* Ancestor: nvk_cmd_set_sample_layout, Maxwell B and later. The scratch
+ * values are which samples each pass of per-sample shading covers; NVK's
+ * macros read them. Needs 14 words.
+ */
+static void
+kgp_push_sample_layout(struct nv_push *p, enum nil_sample_layout sample_layout)
+{
+   static const struct {
+      uint32_t mode, pass2[4], pass4[4];
+   } layouts[] = {
+#define MODE(S) .mode = NV9097_SET_ANTI_ALIAS_SAMPLES_MODE_##S
+      [NIL_SAMPLE_LAYOUT_1X1] = { MODE(1X1) },
+      [NIL_SAMPLE_LAYOUT_2X1] = { MODE(2X1) },
+      [NIL_SAMPLE_LAYOUT_2X1_D3D] = { MODE(2X1_D3D) },
+      [NIL_SAMPLE_LAYOUT_2X2] = {
+         MODE(2X2), { 0x000a0005, 0x000a0005, 0, 0 },
+      },
+      [NIL_SAMPLE_LAYOUT_4X2] = {
+         MODE(4X2),
+         { 0x000f000f, 0x000f000f, 0x00f000f0, 0x00f000f0 },
+         { 0x00030003, 0x000c000c, 0x00300030, 0x00c000c0 },
+      },
+      [NIL_SAMPLE_LAYOUT_4X2_D3D] = {
+         MODE(4X2_D3D),
+         { 0x003a00c5, 0x003a00c5, 0x003a003a, 0x00c500c5 },
+         { 0x00120081, 0x00280044, 0x00280012, 0x00810044 },
+      },
+#undef MODE
+   };
+   assert(sample_layout < ARRAY_SIZE(layouts));
+
+   P_IMMD(p, NV9097, SET_ANTI_ALIAS, layouts[sample_layout].mode);
+   P_MTHD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_SAMPLE_MASKS_2PASS_0));
+   P_INLINE_ARRAY(p, layouts[sample_layout].pass2, 4);
+   P_MTHD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_SAMPLE_MASKS_4PASS_0));
+   P_INLINE_ARRAY(p, layouts[sample_layout].pass4, 4);
+
+   /* Ancestor: nvk_mme_anti_alias_samples: log2 of the sample count in
+    * bits 7:4.
+    */
+   const uint32_t samples = nil_sample_layout_samples(sample_layout);
+   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_ANTI_ALIAS));
+   P_INLINE_DATA(p, nvk_mme_val_mask(util_logbase2(samples) << 4, 0x00f0));
+}
+
+/* Vulkan's standard sample locations, in sixteenths of a pixel, x in the
+ * low nibble (struct nak_sample_location), by log2 of the sample count.
+ * Ancestor: vk_standard_sample_locations_state.
+ */
+static const uint8_t kgp_sample_locations[4][8] = {
+   { 0x88 },
+   { 0xcc, 0x44 },
+   { 0x26, 0x6e, 0xa2, 0xea },
+   { 0x59, 0xb7, 0x9d, 0x35, 0xd3, 0x71, 0xfb, 0x1f },
+};
+
+/* Ancestors: nvk_CmdBeginRendering (no stencil, no stencil, no ZCULL, no
  * multiview, no shading-rate attachment), nvk_cmd_set_sample_layout, and
  * for the clears
  * nvk_CmdClearAttachments + emit_clear_rects.
@@ -816,6 +922,22 @@ kgpBeginRenderPass(KgpCommandBuffer cb, const KgpRenderPassDesc *desc)
          cb->failed = true;
          return;
       }
+   }
+
+   /* One sample count for the whole pass. */
+   const enum nil_sample_layout sample_layout =
+      desc->colorTargets[0].texture->image.sample_layout;
+   bool same_samples =
+      desc->depthTarget.texture == NULL ||
+      desc->depthTarget.texture->image.sample_layout == sample_layout;
+   for (uint32_t i = 1; i < desc->colorTargetCount; i++) {
+      same_samples &= desc->colorTargets[i].texture->image.sample_layout ==
+                      sample_layout;
+   }
+   if (unlikely(!same_samples)) {
+      kgp_err("kgpBeginRenderPass: the targets differ in sample count");
+      cb->failed = true;
+      return;
    }
 
    const KgpDepthTarget *dt = &desc->depthTarget;
@@ -984,24 +1106,8 @@ kgpBeginRenderPass(KgpCommandBuffer cb, const KgpRenderPassDesc *desc)
    P_NVC597_SET_SHADING_RATE_INDEX_SURFACE_BLOCK_SIZE(p, 0, { });
    P_NVC597_SET_SHADING_RATE_INDEX_SURFACE_ALLOCATED_SIZE(p, 0, 0);
 
-   /* Ancestor: nvk_cmd_set_sample_layout(NIL_SAMPLE_LAYOUT_1X1). */
    p = kgp_cb_push(cb, 14);
-   P_IMMD(p, NV9097, SET_ANTI_ALIAS, NV9097_SET_ANTI_ALIAS_SAMPLES_MODE_1X1);
-   P_MTHD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_SAMPLE_MASKS_2PASS_0));
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   P_MTHD(p, NV9097, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_SAMPLE_MASKS_4PASS_0));
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   P_INLINE_DATA(p, 0);
-   /* Ancestor: nvk_mme_anti_alias_samples(1): log2 of the sample count in
-    * bits 7:4.
-    */
-   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_ANTI_ALIAS));
-   P_INLINE_DATA(p, nvk_mme_val_mask(0 << 4, 0x00f0));
+   kgp_push_sample_layout(p, sample_layout);
 
    /* Depth is cleared along with the first colour target that is, or on
     * its own after them: the order of nvk_CmdClearAttachments.
@@ -1106,6 +1212,7 @@ kgpBeginRenderPass(KgpCommandBuffer cb, const KgpRenderPassDesc *desc)
    cb->rp_width = width;
    cb->rp_height = height;
    cb->rp_color_count = desc->colorTargetCount;
+   cb->rp_samples = nil_sample_layout_samples(sample_layout);
    for (uint32_t i = 0; i < desc->colorTargetCount; i++)
       cb->rp_formats[i] = desc->colorTargets[i].texture->format;
    cb->rp_depth_format = dt->texture ? dt->texture->format : KGP_FORMAT_NONE;
@@ -1438,11 +1545,18 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
 
    /* ia */
    P_MTHD(p, NV9097, SET_PRIMITIVE_TOPOLOGY);
-   P_INLINE_DATA(p, raster->topology == KGP_TOPOLOGY_TRIANGLE_STRIP ?
+   /* A mesh shader declares its own, but this state takes precedence:
+    * point list, like NVK and the proprietary driver (nvk_flush_ia_state).
+    */
+   P_INLINE_DATA(p, pipeline->mesh ?
+                    NV9097_SET_PRIMITIVE_TOPOLOGY_V_POINTLIST :
+                    raster->topology == KGP_TOPOLOGY_TRIANGLE_STRIP ?
                     NV9097_SET_PRIMITIVE_TOPOLOGY_V_TRIANGLESTRIP :
                     NV9097_SET_PRIMITIVE_TOPOLOGY_V_TRIANGLELIST);
    P_IMMD(p, NV9097, SET_DA_PRIMITIVE_RESTART, ENABLE_FALSE);
-   P_IMMD(p, NV9097, SET_DA_PRIMITIVE_RESTART_INDEX, 0xffffffff);
+   /* Input-assembly state a mesh pipeline does not have, so NVK leaves it. */
+   if (!pipeline->mesh)
+      P_IMMD(p, NV9097, SET_DA_PRIMITIVE_RESTART_INDEX, 0xffffffff);
 
    /* vp: one viewport and one scissor, the whole render pass, depth 0..1.
     * Ancestors: nvk_emit_viewport, nvk_emit_scissor.
@@ -1578,12 +1692,16 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_SET_SHADING_RATE_CONTROL));
    P_INLINE_DATA(p, nvk_mme_val_mask(0, 1 << 0));
 
-   /* ms: one sample at the pixel centre. The location also goes where NAK's
-    * pixel shaders look for it (nak_const_offsets_turing_graphics): eight
-    * bytes at offset 28 of root table 0.
+   /* ms (ancestor: nvk_flush_ms_state): the standard locations of the
+    * pass's sample count. They also go where NAK's pixel shaders look for
+    * them (nak_const_offsets_turing_graphics): eight bytes at offset 28
+    * of root table 0.
     */
+   const uint8_t *locs = kgp_sample_locations[util_logbase2(cb->rp_samples)];
+   uint32_t loc_words[2];
+   memcpy(loc_words, locs, sizeof(loc_words));
    P_IMMD(p, NV9097, SET_ANTI_ALIAS_ALPHA_CONTROL, {
-      .alpha_to_coverage = false,
+      .alpha_to_coverage = raster->alphaToCoverage,
       .alpha_to_one      = false,
    });
 
@@ -1592,16 +1710,19 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
       .root_table = 0,
       .offset = 28,
    });
-   P_INLINE_DATA(p, 0x88);
-   P_INLINE_DATA(p, 0);
+   P_INLINE_ARRAY(p, loc_words, 2);
 
    P_MTHD(p, NVB197, SET_ANTI_ALIAS_SAMPLE_POSITIONS(0));
    for (uint32_t i = 0; i < 4; i++) {
+      /* Sixteen slots: the samples of four pixels, or of one repeated. */
+      const uint8_t *l[4];
+      for (uint32_t j = 0; j < 4; j++)
+         l[j] = &locs[(i * 4 + j) % cb->rp_samples];
       P_NVB197_SET_ANTI_ALIAS_SAMPLE_POSITIONS(p, i, {
-         .x0 = 8, .y0 = 8,
-         .x1 = 8, .y1 = 8,
-         .x2 = 8, .y2 = 8,
-         .x3 = 8, .y3 = 8,
+         .x0 = *l[0] & 0xf, .y0 = *l[0] >> 4,
+         .x1 = *l[1] & 0xf, .y1 = *l[1] >> 4,
+         .x2 = *l[2] & 0xf, .y2 = *l[2] >> 4,
+         .x3 = *l[3] & 0xf, .y3 = *l[3] >> 4,
       });
    }
 
@@ -1655,14 +1776,15 @@ kgp_cb_flush_gfx_state(struct KgpCommandBuffer_T *cb)
  */
 static bool
 kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
-                  void *indicesGpu, uint32_t index_bytes)
+                  void *indicesGpu, uint32_t index_bytes, bool mesh)
 {
    const struct KgpPipeline_T *pipeline = cb->pipeline;
 
    if (unlikely(!cb->rp_active || pipeline == NULL || !pipeline->graphics ||
+                pipeline->mesh != mesh ||
                 pipeline->raster.colorTargetCount != cb->rp_color_count)) {
-      kgp_err("draw: needs an open render pass and a graphics pipeline with "
-              "its number of colour targets");
+      kgp_err("draw: needs an open render pass and a %s pipeline with "
+              "its number of colour targets", mesh ? "mesh" : "graphics");
       cb->failed = true;
       return false;
    }
@@ -1682,6 +1804,14 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
          return false;
       }
    }
+   if (unlikely(cb->gfx_dirty &&
+                MAX2(pipeline->raster.sampleCount, 1) != cb->rp_samples)) {
+      kgp_err("draw: the render pass's targets have %u samples and the "
+              "pipeline was created for %u", cb->rp_samples,
+              MAX2(pipeline->raster.sampleCount, 1));
+      cb->failed = true;
+      return false;
+   }
    if (unlikely((cb->gfx_dirty || cb->ds_dirty) && cb->ds_state != NULL &&
                 ((cb->ds_state->needs_depth_target &&
                   cb->rp_depth_format == KGP_FORMAT_NONE) ||
@@ -1693,7 +1823,7 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
       return false;
    }
    const uint64_t index_addr = (uintptr_t)indicesGpu;
-   if (unlikely(index_addr == 0 || index_addr % 4 != 0)) {
+   if (unlikely(!mesh && (index_addr == 0 || index_addr % 4 != 0))) {
       kgp_err("draw: indices must be a 4-byte aligned GPU pointer to uint32");
       cb->failed = true;
       return false;
@@ -1704,8 +1834,8 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
                       1, KGP_ROOT_ALIGN_B) ||
        !kgp_check_ptr(cb, "draw: the pixel shader's root pointer", psData,
                       1, KGP_ROOT_ALIGN_B) ||
-       !kgp_check_ptr(cb, "draw: indices", indicesGpu,
-                      indices_known ? index_bytes : 4, 4))
+       (!mesh && !kgp_check_ptr(cb, "draw: indices", indicesGpu,
+                                indices_known ? index_bytes : 4, 4)))
       return false;
 
    /* The two root pointers, inline, into the hardware root table that the
@@ -1732,7 +1862,7 @@ kgp_cb_draw_setup(struct KgpCommandBuffer_T *cb, void *vsData, void *psData,
     * The size is only the hardware's read limit, so a larger one from an
     * earlier draw stands.
     */
-   if (cb->ib_addr != index_addr || index_bytes > cb->ib_bytes) {
+   if (!mesh && (cb->ib_addr != index_addr || index_bytes > cb->ib_bytes)) {
       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BIND_IB));
       P_INLINE_DATA(p, index_addr >> 32);
       P_INLINE_DATA(p, index_addr);
@@ -1781,7 +1911,8 @@ kgpDrawIndexedInstanced(KgpCommandBuffer cb, void *vsData, void *psData,
    }
    if (unlikely(indexCount == 0 || instanceCount == 0))
       return;
-   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, indexCount * 4))
+   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, indexCount * 4,
+                          false))
       return;
 
    struct nv_push *p = kgp_cb_push(cb, 7);
@@ -1814,7 +1945,8 @@ kgpDrawIndexedInstancedIndirect(KgpCommandBuffer cb, void *vsData,
    if (!kgp_check_ptr(cb, "kgpDrawIndexedInstancedIndirect: argsGpu", argsGpu,
                       sizeof(KgpDrawIndexedArgs), 4))
       return;
-   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, UINT32_MAX & ~3u))
+   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, UINT32_MAX & ~3u,
+                          false))
       return;
 
    const uint64_t stride = sizeof(KgpDrawIndexedArgs);
@@ -1860,7 +1992,8 @@ kgpDrawIndexedInstancedIndirectMulti(KgpCommandBuffer cb,
       return;
    if (maxDrawCount == 0)
       return;
-   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, UINT32_MAX & ~3u))
+   if (!kgp_cb_draw_setup(cb, vsData, psData, indicesGpu, UINT32_MAX & ~3u,
+                          false))
       return;
 
    struct nv_push *p = kgp_cb_push(cb, 12);
@@ -1876,4 +2009,59 @@ kgpDrawIndexedInstancedIndirectMulti(KgpCommandBuffer cb,
    P_INLINE_DATA(p, ps_addr >> 32);
    P_INLINE_DATA(p, ps_addr);
    P_INLINE_DATA(p, psStride);
+}
+
+/* Mesh draws ---------------------------------------------------------------- */
+
+/* Ancestor: nvk_CmdDrawMeshTasksEXT. NVK's macro puts the group counts
+ * where the shader reads gl_NumWorkGroups and draws x * y * z points, one
+ * workgroup each.
+ */
+KGP_API void
+kgpDrawMeshlets(KgpCommandBuffer cb, void *msData, void *psData,
+                KgpUvec3 groups)
+{
+   /* NVK's maxMeshWorkGroupCount and maxMeshWorkGroupTotalCount */
+   if (unlikely(groups.y > UINT16_MAX || groups.z > UINT16_MAX ||
+                (uint64_t)groups.x * groups.y * groups.z > (1u << 22))) {
+      kgp_err("kgpDrawMeshlets: at most 2^22 workgroups, 65535 in Y and Z");
+      cb->failed = true;
+      return;
+   }
+   if (unlikely(groups.x == 0 || groups.y == 0 || groups.z == 0))
+      return;
+   if (!kgp_cb_draw_setup(cb, msData, psData, NULL, 0, true))
+      return;
+
+   struct nv_push *p = kgp_cb_push(cb, 4);
+   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_MESH));
+   P_INLINE_DATA(p, groups.x);
+   P_INLINE_DATA(p, groups.y);
+   P_INLINE_DATA(p, groups.z);
+}
+
+/* Ancestor: nvk_CmdDrawMeshTasksIndirect2EXT with one draw. */
+KGP_API void
+kgpDrawMeshletsIndirect(KgpCommandBuffer cb, void *msData, void *psData,
+                        void *groupsGpu)
+{
+   const uint64_t addr = (uintptr_t)groupsGpu;
+   if (unlikely(addr == 0 || addr % 4 != 0)) {
+      kgp_err("kgpDrawMeshletsIndirect: groupsGpu must be a 4-byte aligned "
+              "GPU pointer");
+      cb->failed = true;
+      return;
+   }
+   if (!kgp_check_ptr(cb, "kgpDrawMeshletsIndirect: the group counts",
+                      groupsGpu, sizeof(KgpUvec3), 4) ||
+       !kgp_cb_draw_setup(cb, msData, psData, NULL, 0, true))
+      return;
+
+   struct nv_push *p = kgp_cb_push(cb, 6);
+   P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_MESH_INDIRECT));
+   P_INLINE_DATA(p, addr >> 32);
+   P_INLINE_DATA(p, addr);
+   P_INLINE_DATA(p, 1 /* draw count */);
+   P_INLINE_DATA(p, 0);
+   P_INLINE_DATA(p, sizeof(KgpUvec3) /* stride */);
 }

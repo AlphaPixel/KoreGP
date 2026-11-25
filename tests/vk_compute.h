@@ -69,8 +69,14 @@ vkc_init(struct vkc *c, bool transfer_only)
       exit(1);
    }
 
+   /* For vk_baseline triangle mesh; NVK has it on every GPU KoreGP runs on. */
+   VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
+      .meshShader = VK_TRUE,
+   };
    VkPhysicalDeviceVulkan13Features features13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      .pNext = &mesh_features,
       .dynamicRendering = VK_TRUE,
    };
    VkPhysicalDeviceVulkan12Features features12 = {
@@ -82,6 +88,10 @@ vkc_init(struct vkc *c, bool transfer_only)
    VK_OK(vkCreateDevice(c->pdev, &(VkDeviceCreateInfo) {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &features12,
+      .enabledExtensionCount = 1,
+      .ppEnabledExtensionNames = (const char *[]) {
+         VK_EXT_MESH_SHADER_EXTENSION_NAME,
+      },
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &(VkDeviceQueueCreateInfo) {
          .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,

@@ -129,6 +129,7 @@ struct KgpPipeline_T {
     * once (ancestor: nvk_shader::push_dw).
     */
    bool graphics;
+   bool mesh;                  /* graphics, with a mesh shader first */
    struct nak_shader_info ps_info;
    KgpRasterDesc raster;
    uint32_t *gfx_push;
@@ -140,6 +141,7 @@ struct kgp_gfx_shader {
    const struct nak_shader_info *info;
    uint64_t hdr_addr;          /* the program header; code follows it */
    uint32_t size_B;            /* header and code */
+   uint64_t gs_hdr_addr;       /* mesh shader with per-primitive outputs */
    uint64_t data_addr;         /* constant data, bound as cbuf 1 of the stage */
    uint32_t data_size_B;
 };
@@ -216,6 +218,7 @@ struct KgpCommandBuffer_T {
    uint32_t rp_height;
    uint32_t rp_color_count;
    KGP_FORMAT rp_formats[KGP_MAX_COLOR_TARGETS];
+   uint32_t rp_samples;        /* per pixel, of every target */
    KGP_FORMAT rp_depth_format; /* KGP_FORMAT_NONE: no depth target */
    /* The index buffer this command buffer last bound: an address and how
     * far the hardware may read. Zero: none yet.

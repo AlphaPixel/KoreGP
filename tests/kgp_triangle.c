@@ -19,7 +19,10 @@
  * shader in the same command buffer (tri_scene.h). "bench" times the
  * recording of draws instead of checking one (tri_scene.h). A format's
  * name ("srgb", "rgba16f", "rgba32f", "r32f") draws the plain scene into a
- * target of that format.
+ * target of that format. "mesh" draws the plain scene from a mesh shader,
+ * one workgroup per quad, with a per-primitive output; "meshindirect" has
+ * the GPU read its group counts. "msaa" draws into a four-sample target
+ * and reads it back with a shader that averages the samples (tri_scene.h).
  *
  * Vulkan twin: vk_baseline triangle.
  */
@@ -27,8 +30,11 @@
 
 #include "multi_gen_spv.h"
 #include "saxpy_spv.h"
+#include "tri_mesh_ps_spv.h"
 #include "tri_mrt_ps_spv.h"
+#include "tri_ms_spv.h"
 #include "tri_ps_spv.h"
+#include "tri_resolve_spv.h"
 #include "tri_scene.h"
 #include "tri_vs_spv.h"
 
@@ -45,6 +51,9 @@ main(int argc, char **argv)
    const bool stencil = argc > 1 && strcmp(argv[1], "stencil") == 0;
    const bool state = argc > 1 && strcmp(argv[1], "state") == 0;
    const bool mrt = argc > 1 && strcmp(argv[1], "mrt") == 0;
+   const bool msaa = argc > 1 && strcmp(argv[1], "msaa") == 0;
+   const bool meshind = argc > 1 && strcmp(argv[1], "meshindirect") == 0;
+   const bool mesh = meshind || (argc > 1 && strcmp(argv[1], "mesh") == 0);
    const bool multigpu = argc > 1 && strcmp(argv[1], "multigpu") == 0;
    const bool multi = multigpu || (argc > 1 && strcmp(argv[1], "multi") == 0);
    const bool bench = argc > 1 && strcmp(argv[1], "bench") == 0;
@@ -85,6 +94,8 @@ main(int argc, char **argv)
    CHECK(vertices && indices && vs_root && ps_root && out);
 
    tri_fill(vertices, indices);
+   for (unsigned i = 0; msaa && i < TRI_VERTEX_COUNT; i++)
+      vertices[i].pos[0] += TRI_MSAA_SHIFT;
    *vs_root = (struct tri_vs_root) {
       .vertices = (uintptr_t)kgpHostToDevicePointer(dev, vertices),
       .instance_step = TRI_INSTANCE_STEP,
@@ -149,6 +160,7 @@ main(int argc, char **argv)
       .format = target_formats[tfmt],
       .width = TRI_W,
       .height = TRI_H,
+      .sampleCount = msaa ? TRI_MSAA_SAMPLES : 0,
    };
    KgpSizeAlign sa;
    CHECK(kgpTextureSizeAlign(dev, &tex_desc, &sa));
@@ -237,18 +249,36 @@ main(int argc, char **argv)
       .colorTargetCount = mrt ? 2 : 1,
       .colorFormats = { target_formats[tfmt], target_formats[tfmt] },
       .depthFormat = has_depth ? depth_desc.format : KGP_FORMAT_NONE,
+      .sampleCount = msaa ? TRI_MSAA_SAMPLES : 0,
       .colorWrite = {
          [1] = KGP_COLOR_WRITE_R | KGP_COLOR_WRITE_G | KGP_COLOR_WRITE_A,
       },
    };
-   KgpPipeline pipeline = kgpCreateGraphicsPipeline(
-      dev, SPAN(tri_vs_spv),
-      mrt ? SPAN(tri_mrt_ps_spv) : SPAN(tri_ps_spv), &raster, NULL);
+   KgpPipeline pipeline = mesh
+      ? kgpCreateMeshPipeline(dev, SPAN(tri_ms_spv), SPAN(tri_mesh_ps_spv),
+                              &raster, NULL)
+      : kgpCreateGraphicsPipeline(
+           dev, SPAN(tri_vs_spv),
+           mrt ? SPAN(tri_mrt_ps_spv) : SPAN(tri_ps_spv), &raster, NULL);
    KgpRasterDesc bad_raster = raster;
    bad_raster.colorWrite[0] = KGP_COLOR_WRITE_NONE | KGP_COLOR_WRITE_A;
    CHECK(!kgpCreateGraphicsPipeline(dev, SPAN(tri_vs_spv), SPAN(tri_ps_spv),
                                     &bad_raster, NULL));
    KgpPipeline compute = kgpCreateComputePipeline(dev, SPAN(saxpy_spv), NULL);
+   /* "msaa": the shader that reads the target back, and its heap of one. */
+   KgpPipeline resolve =
+      kgpCreateComputePipeline(dev, SPAN(tri_resolve_spv), NULL);
+   KgpDescriptor256 *heap =
+      kgpMalloc(dev, sizeof(*heap), 64, KGP_MEMORY_DEFAULT);
+   struct tri_resolve_root *resolve_root =
+      kgpMalloc(dev, sizeof(*resolve_root), 64, KGP_MEMORY_DEFAULT);
+   CHECK(resolve && heap && resolve_root);
+   CHECK(kgpTextureViewDescriptor(target, NULL, &heap[0]));
+   *resolve_root = (struct tri_resolve_root) {
+      .dst = (uintptr_t)kgpHostToDevicePointer(dev, out),
+      .width = TRI_W,
+      .samples = msaa ? TRI_MSAA_SAMPLES : 1,
+   };
    KgpSemaphore done = kgpCreateSemaphore(dev, 0);
    CHECK(pipeline && compute && done);
 
@@ -363,7 +393,18 @@ main(int argc, char **argv)
    kgpBeginRenderPass(cb, &pass);
    kgpSetPipeline(cb, pipeline);
    KgpDrawIndexedArgs *args = NULL;
-   if (indirect) {
+   KgpUvec3 *mesh_groups = NULL;
+   if (meshind) {
+      mesh_groups = kgpMalloc(dev, sizeof(*mesh_groups), 64,
+                              KGP_MEMORY_DEFAULT);
+      CHECK(mesh_groups);
+      *mesh_groups = (KgpUvec3) { TRI_INSTANCE_COUNT, 1, 1 };
+      kgpDrawMeshletsIndirect(cb, vs_gpu, ps_gpu,
+                              kgpHostToDevicePointer(dev, mesh_groups));
+   } else if (mesh) {
+      kgpDrawMeshlets(cb, vs_gpu, ps_gpu,
+                      (KgpUvec3) { TRI_INSTANCE_COUNT, 1, 1 });
+   } else if (indirect) {
       args = kgpMalloc(dev, sizeof(*args), 64, KGP_MEMORY_DEFAULT);
       CHECK(args);
       *args = (KgpDrawIndexedArgs) {
@@ -407,10 +448,19 @@ main(int argc, char **argv)
                               TRI_INDEX_COUNT, TRI_INSTANCE_COUNT);
    }
    kgpEndRenderPass(cb);
-   kgpBarrier(cb, KGP_STAGE_RASTER_COLOR_OUT, KGP_STAGE_TRANSFER,
-              KGP_HAZARD_NONE);
-   kgpCopyFromTexture(cb, target, 0, 0, kgpHostToDevicePointer(dev, out),
-                      TRI_W * bpp);
+   if (msaa) {
+      kgpBarrier(cb, KGP_STAGE_RASTER_COLOR_OUT, KGP_STAGE_COMPUTE,
+                 KGP_HAZARD_NONE);
+      kgpSetActiveTextureHeapPtr(cb, kgpHostToDevicePointer(dev, heap), 1);
+      kgpSetPipeline(cb, resolve);
+      kgpDispatch(cb, kgpHostToDevicePointer(dev, resolve_root),
+                  (KgpUvec3) { TRI_W / 8, TRI_H / 8, 1 });
+   } else {
+      kgpBarrier(cb, KGP_STAGE_RASTER_COLOR_OUT, KGP_STAGE_TRANSFER,
+                 KGP_HAZARD_NONE);
+      kgpCopyFromTexture(cb, target, 0, 0, kgpHostToDevicePointer(dev, out),
+                         TRI_W * bpp);
+   }
    if (mrt) {
       kgpCopyFromTexture(cb, target1, 0, 0,
                          kgpHostToDevicePointer(dev, out1), TRI_W * 4);
@@ -421,6 +471,7 @@ main(int argc, char **argv)
     * when the GPU read them (MMU fault, window of 2026-11-22).
     */
    kgpFree(dev, args);
+   kgpFree(dev, mesh_groups);
    CHECK(kgpWaitSemaphore(dev, done, 1, KGP_TEST_TIMEOUT_NS));
 
    /* Misuse fails the command buffer, not the process. */
@@ -479,7 +530,9 @@ main(int argc, char **argv)
                  "%u, expected %u\n", *multi_count, TRI_MULTI_COUNT);
          ret = 1;
       }
-      if (ret == 0 && tfmt != TRI_TARGET_RGBA8)
+      if (ret == 0 && msaa)
+         ret = tri_check_msaa("triangle", out);
+      else if (ret == 0 && tfmt != TRI_TARGET_RGBA8)
          ret = tri_check_target("triangle", out, tfmt);
       else if (ret == 0)
          ret = tri_check("triangle", out, TRI_W, scene);
@@ -520,6 +573,9 @@ cleanup:
    kgpFree(dev, candidates);
    kgpDestroySemaphore(dev, done);
    kgpDestroyPipeline(dev, compute);
+   kgpDestroyPipeline(dev, resolve);
+   kgpFree(dev, resolve_root);
+   kgpFree(dev, heap);
    kgpDestroyPipeline(dev, pipeline);
    kgpFree(dev, multi_count);
    kgpFree(dev, multi_args);

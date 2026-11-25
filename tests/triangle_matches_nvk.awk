@@ -41,7 +41,17 @@ END {
          first = i - 4      # the 3 prologue methods and the view mask
       # The draw macro and its parameters: direct (slot 12, six of them) or,
       # with -v indirect=1, indexed-indirect (slot 14, five).
-      if (!indirect && lines[i] ~ /CALL_MME_MACRO\(12\)/) {
+      # With -v mesh=1, the mesh draw (slot 28, three); with mesh=2, the
+      # indirect mesh draw (slot 29, five).
+      if (mesh == 1 && lines[i] ~ /CALL_MME_MACRO\(28\)/) {
+         last = i + 2
+         break
+      }
+      if (mesh == 2 && lines[i] ~ /CALL_MME_MACRO\(29\)/) {
+         last = i + 4
+         break
+      }
+      if (!indirect && !mesh && lines[i] ~ /CALL_MME_MACRO\(12\)/) {
          last = i + 5
          break
       }
@@ -84,7 +94,7 @@ END {
       # Indirect draw: the address of the arguments.
       if (l ~ /CALL_MME_MACRO\(4\)/)
          ib = indirect ? 3 : 2
-      if (l ~ /CALL_MME_MACRO\(14\)/)
+      if (l ~ /CALL_MME_MACRO\((14|29)\)/)
          ib = 2
       if (ib > 0 || l ~ /LOAD_ROOT_TABLE|SET_COLOR_TARGET_[AB]\([0-7]\)|SET_ZT_[AB] |PROGRAM_ADDRESS_[AB]/) {
          gsub(/\(0x[0-9a-f]+\)/, "(masked)", l)

@@ -80,7 +80,8 @@ step gfx_pipeline mtest --suite koregp-hardware kgp_gfx_pipeline
 step vk_triangle mtest --suite koregp-hardware \
    vk_triangle vk_triangle_indirect vk_triangle_depth vk_triangle_stencil \
    vk_triangle_state vk_triangle_mrt vk_triangle_srgb vk_triangle_rgba16f \
-   vk_triangle_rgba32f vk_triangle_r32f
+   vk_triangle_rgba32f vk_triangle_r32f vk_triangle_mesh \
+   vk_triangle_meshindirect vk_triangle_msaa
 step triangle mtest --suite koregp-hardware kgp_triangle
 step triangle_indirect mtest --suite koregp-hardware kgp_triangle_indirect
 step textured mtest --suite koregp-hardware kgp_textured
@@ -110,6 +111,14 @@ step mrt mtest --suite koregp-hardware kgp_triangle_mrt
 # The plain scene into render targets of other formats.
 step formats mtest --suite koregp-hardware kgp_triangle_srgb \
    kgp_triangle_rgba16f kgp_triangle_rgba32f kgp_triangle_r32f
+# The plain scene from a mesh shader, direct and with GPU-read group counts.
+step mesh mtest --suite koregp-hardware kgp_triangle_mesh \
+   kgp_triangle_meshindirect
+# Four samples per pixel, read back by a shader that averages them.
+step msaa mtest --suite koregp-hardware kgp_triangle_msaa
+# Split barriers. Last of the correctness steps: a wait the hardware never
+# satisfied would hold that process's channel until the kernel times it out.
+step split mtest --suite koregp-hardware kgp_split
 
 # If anything KoreGP failed, a rerun of saxpy that narrows it down while the
 # window is open: waiting after every submit, with the pushbuf dumped at the
@@ -120,7 +129,7 @@ case "$failed" in *kgp_*|*copy_*|*heap_*)
    ;;
 esac
 # The same for raster, on the triangle; its own output shows the image.
-case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*state*|*mrt*|*formats*|*multi*|*present*)
+case "$failed" in *triangle*|*textured*|*depth*|*stencil*|*state*|*mrt*|*formats*|*mesh*|*msaa*|*multi*|*present*)
    tri_dbg() { KGP_DEBUG=sync kgp_run "$KGP_PREFIX/bin/kgp_triangle"; }
    STEP_TAIL=60 step diag_triangle tri_dbg
    ;;
@@ -174,11 +183,14 @@ if [ -x "$REL/bin/bench_dispatch" ]; then
    }
    run_bench_draw() {
       for _ in 1 2 3; do
-         rel "$REL/bin/kgp_triangle" bench 2000 100 || return 1
+         rel "$REL/bin/kgp_triangle" bench 2000 100 2>/dev/null || return 1
          rel "$REL/bin/vk_baseline" triangle bench 2000 100 2>/dev/null || return 1
       done
+      # The shape of the offline table: the per-draw cost on its own.
+      rel "$REL/bin/kgp_triangle" bench 500 1000 2>/dev/null || return 1
+      rel "$REL/bin/vk_baseline" triangle bench 500 1000 2>/dev/null || return 1
    }
-   STEP_TAIL=6 step bench_draw run_bench_draw
+   STEP_TAIL=8 step bench_draw run_bench_draw
 
    # GPU time (tests/bench_gpu.c):
    #  - saxpy at full and quarter size: memory-bound in the first window,
